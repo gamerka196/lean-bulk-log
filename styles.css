@@ -176,6 +176,34 @@ b { font-weight: 650; }
 .spinner { width: 30px; height: 30px; margin: 14px auto 6px; border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--accent); animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .notice { background: color-mix(in srgb, var(--warn) 16%, var(--card2)); border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line)); border-radius: 12px; padding: 10px 12px; margin-bottom: 12px; font-size: 13.5px; display: grid; gap: 4px; }
+/* train */
+.w-body { flex: 1; overflow-y: auto; padding: 8px 12px 24px; }
+.xcard { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 12px; margin: 10px 0; }
+.xhead { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.xhead b { font-size: 16.5px; }
+.ghost.sm0 { padding: 4px 6px; font-size: 13px; }
+.pill.sm1 { padding: 6px 11px; font-size: 13px; }
+.xlast { font-size: 12.5px; color: var(--muted); margin: 2px 0 8px; }
+.set { display: grid; grid-template-columns: 20px 1fr 1fr 46px; gap: 6px; align-items: center; margin: 6px 0; padding: 4px; border-radius: 14px; border: 1px solid transparent; }
+.set.done { background: color-mix(in srgb, var(--accent) 14%, var(--card)); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.set-n { color: var(--muted); font-size: 13px; text-align: center; }
+.stp { display: flex; align-items: center; gap: 3px; min-width: 0; }
+.stp button { width: 32px; height: 44px; border-radius: 11px; background: var(--card2); border: 1px solid var(--line); font-size: 20px; flex: none; }
+.stp button:active { background: var(--line); }
+.stp input { flex: 1; min-width: 0; width: 100%; height: 44px; text-align: center; font-size: 18px; font-weight: 650; border-radius: 11px; border: 1px solid var(--line); background: var(--card2); outline: none; padding: 0 2px; }
+.stp input:focus { border-color: var(--accent); }
+.chk { width: 46px; height: 44px; border-radius: 13px; background: var(--card2); border: 1px solid var(--line); font-size: 22px; color: var(--muted); }
+.set.done .chk { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.xfoot { display: flex; gap: 8px; margin-top: 8px; }
+.rest-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 14px calc(10px + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--line); }
+.rest-bar[hidden] { display: none; }
+.rest-bar.over { background: color-mix(in srgb, var(--accent) 22%, var(--card)); }
+.rest-btns { display: flex; gap: 6px; }
+.rx { border: 1px solid var(--line); border-radius: 14px; padding: 10px; margin: 8px 0; background: var(--card2); }
+.rx input { width: 100%; padding: 9px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); outline: none; }
+.rx-name { font-weight: 650; margin-bottom: 6px; }
+.rx-row { display: flex; gap: 8px; } .rx-row label { font-size: 12px; color: var(--muted); display: grid; gap: 3px; } .rx-row label:first-child { width: 70px; }
+.rx-btns { display: flex; gap: 6px; margin-top: 8px; } .rx-btns button { padding: 6px 10px; border-radius: 9px; background: var(--card); border: 1px solid var(--line); font-size: 13px; }
 /* coach */
 .coach-card { display: flex; align-items: center; gap: 12px; width: calc(100% - 28px); text-align: left; }
 .coach-card:active { background: var(--card2); }
