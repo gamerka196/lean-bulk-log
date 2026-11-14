@@ -628,6 +628,9 @@ function viewSettings() {
     <div class="small muted" id="scan-test-result" style="margin-top:8px"></div></div>
   <div class="card"><h2>Backup &amp; export</h2><div class="small muted" style="margin-bottom:10px">Last backup: <b>${last}</b>. Clearing browser data erases everything here, so export now and then and keep the file in Drive/Photos.</div>
     <div class="btn-row" style="margin-top:0"><button class="btn primary" data-act="export-json">Backup (JSON)</button><button class="btn" data-act="import-json">Restore…</button></div>
+    <button class="btn block" style="margin-top:8px" data-act="merge-json">Import history (keep my data)…</button>
+    <div class="small muted" style="margin-top:6px"><b>Restore</b> replaces everything. <b>Import history</b> only adds what’s missing — use it to load an old backup without losing newer logs.</div>
+    <input type="file" id="merge-file" accept=".json,application/json" hidden>
     <button class="btn block" style="margin-top:8px" data-act="export-csv">Export log for Excel (CSV)</button>
     <input type="file" id="import-file" accept=".json,application/json" hidden>
     <div class="small muted" style="margin-top:10px" id="persist-note"></div></div>
@@ -663,12 +666,56 @@ function exportCsv() {
   download(`lean-bulk-log-${todayStr()}.csv`, '﻿' + rows.map((r) => r.map(q).join(',')).join('\r\n'), 'text/csv');
   toast('CSV exported');
 }
-function importJson(file) {
+/* Merge a backup INTO the current data: nothing existing is removed or changed. Safe to run twice. */
+function mergeBackup(o) {
+  const snap = JSON.stringify(S);
+  const key = (s) => String(s).trim().toLowerCase();
+  const byName = new Map(S.foods.map((f) => [key(f.name), f]));
+  const idMap = {};
+  let addedFoods = 0;
+  for (const f of o.foods) {
+    if (!f || !f.name) continue;
+    let local = byName.get(key(f.name));
+    if (!local) {
+      local = { ...f };
+      if (S.foods.some((x) => x.id === local.id)) local.id = 'f' + uid();
+      S.foods.push(local); byName.set(key(local.name), local); addedFoods++;
+    }
+    idMap[f.id] = local.id;
+  }
+  const have = new Set();
+  for (const es of Object.values(S.log)) for (const e of es) have.add(e.id);
+  let addedEntries = 0, addedDays = 0;
+  for (const [d, es] of Object.entries(o.log || {})) {
+    const fresh = (es || []).filter((e) => e && e.id && e.per && typeof e.qty === 'number' && !have.has(e.id));
+    if (!fresh.length) continue;
+    const list = (S.log[d] = S.log[d] || []);
+    if (!list.length) addedDays++;
+    for (const e of fresh) { list.push({ ...e, foodId: idMap[e.foodId] || e.foodId, per: { ...e.per } }); addedEntries++; }
+  }
+  let addedMeals = 0;
+  for (const m of o.meals || []) {
+    if (m && m.name && !S.meals.some((x) => key(x.name) === key(m.name))) {
+      S.meals.push({ ...m, id: 'm' + uid(), items: (m.items || []).map((it) => ({ ...it, foodId: idMap[it.foodId] || it.foodId })) }); addedMeals++;
+    }
+  }
+  for (const s of o.supps || []) if (s && s.name && !S.supps.some((x) => key(x.name) === key(s.name))) S.supps.push({ ...s, id: 's' + uid() });
+  save(); refresh();
+  toast(addedEntries ? `Merged ${addedEntries} entries (${addedDays} new days) and ${addedFoods} new foods` : 'Nothing new to merge — it’s already in the app', addedEntries || addedFoods ? () => { S = JSON.parse(snap); save(); refresh(); } : null);
+  return { addedEntries, addedDays, addedFoods, addedMeals };
+}
+
+function importJson(file, merge = false) {
   const rd = new FileReader();
   rd.onload = () => {
     try {
       const o = JSON.parse(rd.result);
       if (!Array.isArray(o.foods) || typeof o.log !== 'object') throw new Error('bad');
+      if (merge) {
+        const days = Object.values(o.log).filter((a) => a && a.length).length;
+        askConfirm(`Add up to ${days} logged days and any foods you don’t have yet from this file? Everything already in the app stays.`, 'Merge', () => mergeBackup(o));
+        return;
+      }
       askConfirm(`Replace everything in the app with this backup (${o.foods.length} foods, ${Object.keys(o.log).length} days)?`, 'Restore', () => { S = o; save(); viewDate = todayStr(); refresh(); toast('Backup restored'); });
     } catch (e) { toast('That file is not a Lean Bulk Log backup'); }
   };
@@ -706,6 +753,7 @@ const actions = {
   'export-json': () => exportJson(),
   'export-csv': () => exportCsv(),
   'import-json': () => $('#import-file').click(),
+  'merge-json': () => $('#merge-file').click(),
   'scan-label': () => { if (scanReady()) scanPick(false); else scanSetupSheet(); },
   'scan-retry': () => { closeLayer(); setTimeout(() => scanPick(false), 280); },
   'scan-gallery': () => { closeLayer(); setTimeout(() => scanPick(true), 280); },
@@ -729,6 +777,7 @@ document.addEventListener('change', (e) => {
     if (Number.isFinite(v) && v >= 0) { S.targets[t.dataset.t] = v; save(); const T = S.targets; $('#macro-hint').innerHTML = hint(T.p * 4 + T.c * 4 + T.f * 9, T.k); }
   }
   if (t.id === 'import-file' && t.files[0]) { importJson(t.files[0]); t.value = ''; }
+  if (t.id === 'merge-file' && t.files[0]) { importJson(t.files[0], true); t.value = ''; }
   if (t.dataset && t.dataset.scan) { const clean = t.value.replace(/\s+/g, ''); t.value = clean; const c = scanCfg(); c[t.dataset.scan] = clean; setScanCfg(c); }
   if ((t.id === 'scan-file' || t.id === 'scan-file-gallery') && t.files[0]) { const file = t.files[0]; t.value = ''; handleScan(file); }
 });
