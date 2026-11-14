@@ -305,7 +305,7 @@ function viewHistory() {
 let foodQ = '';
 function viewFoods() {
   return `<div class="top"><div><h1>Foods</h1><div class="sub">${S.foods.length} in your database</div></div>
-    <button class="btn primary" data-act="new-food">+ New</button></div>
+    <div style="display:flex;gap:8px"><button class="btn" data-act="scan-label" aria-label="Scan a nutrition label" style="padding:10px 12px;color:var(--accent)">${CAMERA_SVG}</button><button class="btn primary" data-act="new-food">+ New</button></div></div>
     <div style="padding:10px 14px 0"><div class="search"><input id="food-q" type="search" placeholder="Search foods…" value="${esc(foodQ)}" autocomplete="off"></div></div>
     <div class="list" id="food-list"></div>`;
 }
@@ -319,12 +319,14 @@ function renderFoodList() {
   $('#food-list').innerHTML = list.map((f) => foodRow(f)).join('') || '<div class="empty">No matches.</div>';
 }
 
-function openFoodForm(food, { fromAdd = false } = {}) {
+function openFoodForm(food, { fromAdd = false, prefill = null, banner = '', photo = '' } = {}) {
   const isNew = !food;
-  const f = food || { name: addEl ? (addState.q || '') : (tab === 'foods' ? foodQ : ''), serving: '1 serving', k: '', p: '', c: '', f: '', s: 0, cat: 'Other', g: '' };
+  const f = food || { name: addEl ? (addState.q || '') : (tab === 'foods' ? foodQ : ''), serving: '1 serving', k: '', p: '', c: '', f: '', s: 0, cat: 'Other', g: '', ...(prefill || {}) };
   const cats = [...new Set([...S.foods.map((x) => x.cat), 'Other'])].sort();
   const el = openLayer(`
-    <div class="sheet-title">${isNew ? 'New food' : 'Edit food'}</div>
+    ${photo ? `<img class="scan-thumb" src="${photo}" alt="Your label photo">` : ''}
+    ${banner ? `<div class="notice">${banner}</div>` : ''}
+    <div class="sheet-title">${isNew ? (prefill ? 'Check scanned food' : 'New food') : 'Edit food'}</div>
     <div class="muted small" style="margin-bottom:12px">Macros are per one serving.${isNew ? '' : ' Past log entries keep the macros they were logged with.'}</div>
     <div class="field"><label>Name</label><input id="ff-name" value="${esc(f.name)}" autocomplete="off"></div>
     <div class="grid2"><div class="field"><label>Serving (e.g. “100 g”, “1 bar”)</label><input id="ff-serving" value="${esc(f.serving)}"></div>
@@ -361,6 +363,8 @@ function openFoodForm(food, { fromAdd = false } = {}) {
   });
 }
 
+const CAMERA_SVG = '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>';
+
 /* ---------- ADD FLOW ---------- */
 let addEl = null;
 let addState = { q: '', cat: 'All' };
@@ -368,7 +372,8 @@ let addState = { q: '', cat: 'All' };
 function openAdd() {
   addState = { q: '', cat: 'All' };
   addEl = openLayer(`
-    <div class="add-head"><div class="search"><input id="q" type="search" placeholder="Search foods…" autocomplete="off"></div><button class="ghost" data-act="close-layer">Done</button></div>
+    <div class="add-head"><div class="search"><input id="q" type="search" placeholder="Search foods…" autocomplete="off"></div>
+      <button class="icon-btn" data-act="scan-label" aria-label="Scan a nutrition label" style="color:var(--accent)">${CAMERA_SVG}</button><button class="ghost" data-act="close-layer">Done</button></div>
     <div class="add-body" id="add-body"></div><div class="add-foot" id="add-foot"></div>`, { full: true });
   $('#q', addEl).addEventListener('input', (e) => { addState.q = e.target.value; renderAddBody(); });
   renderAddBody(); renderAddFoot();
@@ -464,6 +469,94 @@ function openQty({ food, entry }) {
   paint(true);
 }
 
+/* ---------- LABEL SCANNER (photo -> proxy -> Claude -> pre-filled food form) ---------- */
+const SCAN_KEY = 'lbl.scan'; // kept outside the main state so the token never lands in backups
+const scanCfg = () => { try { return JSON.parse(localStorage.getItem(SCAN_KEY)) || {}; } catch (e) { return {}; } };
+const setScanCfg = (c) => { try { localStorage.setItem(SCAN_KEY, JSON.stringify(c)); } catch (e) { toast('Could not save scanner settings'); } };
+const scanReady = () => { const c = scanCfg(); return !!(c.url && c.token); };
+
+async function prepImage(file) {
+  const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  if (bmp.close) bmp.close();
+  const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.85));
+  const b64 = await new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(',')[1]); fr.onerror = rej; fr.readAsDataURL(blob); });
+  return { b64, blobUrl: URL.createObjectURL(blob) };
+}
+
+function scannedToForm(x) {
+  const num = (v) => (Number.isFinite(+v) && +v > 0 ? +v : 0);
+  const k = Math.round(num(x.calories)), p = r1(num(x.protein_g)), c = r1(num(x.carbs_g)), f = r1(num(x.fat_g));
+  const prefill = { name: (x.product_name || '').trim(), serving: (x.serving_label || '').trim() || '1 serving', g: num(x.serving_grams) || '', k, p, c, f, s: r1(num(x.sugar_g)), cat: 'Other' };
+  const warn = [];
+  const calc = p * 4 + c * 4 + f * 9;
+  if (Math.abs(calc - k) > Math.max(30, k * 0.2)) warn.push(`Calories (${k}) don't match the macros (~${Math.round(calc)}) — double-check them against the photo.`);
+  if (x.confidence !== 'high') warn.push(`Claude wasn't fully sure about this label (${esc(x.confidence)} confidence).`);
+  if (x.notes) warn.push(esc(x.notes));
+  return { prefill, banner: `<b>Check these against your photo before saving.</b>${warn.map((w) => `<div>⚠ ${w}</div>`).join('')}` };
+}
+
+function scanSetupSheet() {
+  openLayer(`<div class="sheet-title">Set up label scanning</div>
+    <div class="muted" style="margin:6px 0 12px">Scanning needs a small proxy that holds your Claude API key (one-time setup, steps in the README). Then paste its address and your app token under <b>Settings → Label scanner</b>.</div>
+    <div class="btn-row"><button class="btn" data-act="close-layer">Not now</button><button class="btn primary" data-act="scan-go-settings">Open settings</button></div>`);
+}
+
+function scanPick(gallery) {
+  const input = $(gallery ? '#scan-file-gallery' : '#scan-file');
+  input.value = '';
+  input.click();
+}
+
+async function handleScan(file) {
+  const cfg = scanCfg();
+  const el = openLayer(`<div class="sheet-title" id="scan-title">Reading label…</div>
+    <div class="muted small" id="scan-status">Preparing photo</div>
+    <img id="scan-img" class="scan-thumb" alt="" hidden><div class="spinner" id="scan-spin"></div><div id="scan-actions"></div>`);
+  const fail = (msg) => {
+    $('#scan-title', el).textContent = 'Couldn’t read that';
+    $('#scan-status', el).textContent = msg;
+    $('#scan-spin', el).hidden = true;
+    $('#scan-actions', el).innerHTML = `<div class="btn-row" style="flex-wrap:wrap"><button class="btn" data-act="scan-retry">Retake</button><button class="btn" data-act="scan-gallery">From gallery</button><button class="btn primary" data-act="scan-manual">Enter manually</button></div>`;
+  };
+  let photoUrl = '';
+  try {
+    const { b64, blobUrl } = await prepImage(file);
+    photoUrl = blobUrl;
+    const img = $('#scan-img', el); img.src = blobUrl; img.hidden = false;
+    $('#scan-status', el).textContent = 'Asking Claude to read it…';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 60000);
+    let res;
+    try {
+      res = await fetch(cfg.url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': cfg.token }, body: JSON.stringify({ image: b64, mediaType: 'image/jpeg' }), signal: ctrl.signal });
+    } finally { clearTimeout(timer); }
+    const data = await res.json().catch(() => null);
+    if (!data || !data.ok) return fail((data && data.error) || `Scan server error (${res.status}).`);
+    if (!data.food.is_nutrition_label) return fail('That doesn’t look like a Nutrition Facts label. Try a closer, flatter shot of the panel.');
+    const { prefill, banner } = scannedToForm(data.food);
+    const fromAdd = !!addEl;
+    closeLayer();
+    setTimeout(() => openFoodForm(null, { fromAdd, prefill, banner, photo: photoUrl }), 280);
+  } catch (e) {
+    fail(e.name === 'AbortError' ? 'Took too long — check your connection and try again.' : e instanceof TypeError ? 'Couldn’t reach the scan server — check your connection and the proxy address in Settings.' : 'Something went wrong reading the photo.');
+  }
+}
+
+async function testScanner(btn) {
+  const c = scanCfg(), out = $('#scan-test-result');
+  if (!c.url || !c.token) { out.textContent = 'Enter the proxy address and token first.'; return; }
+  btn.disabled = true; out.textContent = 'Testing…';
+  try {
+    const r = await fetch(c.url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': c.token }, body: '{}' });
+    out.textContent = r.status === 401 ? '✗ The proxy rejected your app token.' : r.status === 413 ? '✓ Connected — the proxy accepted your token.' : r.status === 403 ? '✗ The proxy does not allow this website (check ALLOWED_ORIGIN).' : `Unexpected reply (${r.status}).`;
+  } catch (e) { out.textContent = '✗ Could not reach that address.'; }
+  btn.disabled = false;
+}
+
 /* ---------- confirm / menus ---------- */
 function askConfirm(msg, okLabel, fn) {
   const el = openLayer(`<div class="sheet-title">${esc(msg)}</div><div class="btn-row"><button class="btn" data-act="close-layer">Cancel</button><button class="btn primary" id="c-ok">${esc(okLabel)}</button></div>`);
@@ -526,6 +619,11 @@ function viewSettings() {
     <div class="grid2" style="margin-top:8px"><div class="field" style="margin:0"><input id="sp-name" placeholder="Name" autocomplete="off"></div><div class="field" style="margin:0"><input id="sp-dose" placeholder="Dose (optional)" autocomplete="off"></div></div>
     <button class="btn block" style="margin-top:10px" data-act="add-supp">Add supplement</button></div>
   <div class="card"><h2>Saved meals</h2>${S.meals.length ? S.meals.map((m) => `<button class="row" style="padding-left:0;padding-right:0" data-act="meal" data-id="${m.id}"><div class="row-main"><div class="name">${esc(m.name)}</div><div class="sub">${m.items.length} items · ${fmtK(mealTotals(m).k)} kcal</div></div><span class="muted">›</span></button>`).join('') : '<div class="muted small">Log a few foods, then use ⋯ → “Save entries as a meal” on the Today screen.</div>'}</div>
+  <div class="card"><h2>Label scanner</h2><div class="small muted" style="margin-bottom:10px">Photograph a Nutrition Facts label and Claude fills in the food. Needs your own proxy — see the README. The token stays on this phone and is not included in backups.</div>
+    <div class="field"><label>Proxy address</label><input id="scan-url" data-scan="url" inputmode="url" autocomplete="off" placeholder="https://lean-bulk-log-scan.your-name.workers.dev" value="${esc(scanCfg().url || '')}"></div>
+    <div class="field"><label>App token</label><input id="scan-token" data-scan="token" type="password" autocomplete="off" value="${esc(scanCfg().token || '')}"></div>
+    <div class="btn-row" style="margin-top:0"><button class="btn" data-act="scan-test">Test connection</button></div>
+    <div class="small muted" id="scan-test-result" style="margin-top:8px"></div></div>
   <div class="card"><h2>Backup &amp; export</h2><div class="small muted" style="margin-bottom:10px">Last backup: <b>${last}</b>. Clearing browser data erases everything here, so export now and then and keep the file in Drive/Photos.</div>
     <div class="btn-row" style="margin-top:0"><button class="btn primary" data-act="export-json">Backup (JSON)</button><button class="btn" data-act="import-json">Restore…</button></div>
     <button class="btn block" style="margin-top:8px" data-act="export-csv">Export log for Excel (CSV)</button>
@@ -606,6 +704,12 @@ const actions = {
   'export-json': () => exportJson(),
   'export-csv': () => exportCsv(),
   'import-json': () => $('#import-file').click(),
+  'scan-label': () => { if (scanReady()) scanPick(false); else scanSetupSheet(); },
+  'scan-retry': () => { closeLayer(); setTimeout(() => scanPick(false), 280); },
+  'scan-gallery': () => { closeLayer(); setTimeout(() => scanPick(true), 280); },
+  'scan-manual': () => { const fromAdd = !!addEl; closeLayer(); setTimeout(() => openFoodForm(null, { fromAdd }), 280); },
+  'scan-test': (el) => testScanner(el),
+  'scan-go-settings': () => { closeLayer(); if (addEl) closeLayer(); tab = 'settings'; setTimeout(() => { window.scrollTo(0, 0); render(); }, 280); },
   install: async () => { if (!deferredInstall) return; deferredInstall.prompt(); await deferredInstall.userChoice; deferredInstall = null; refresh(); },
 };
 
@@ -623,6 +727,8 @@ document.addEventListener('change', (e) => {
     if (Number.isFinite(v) && v >= 0) { S.targets[t.dataset.t] = v; save(); const T = S.targets; $('#macro-hint').innerHTML = hint(T.p * 4 + T.c * 4 + T.f * 9, T.k); }
   }
   if (t.id === 'import-file' && t.files[0]) { importJson(t.files[0]); t.value = ''; }
+  if (t.dataset && t.dataset.scan) { const c = scanCfg(); c[t.dataset.scan] = t.value.trim(); setScanCfg(c); }
+  if ((t.id === 'scan-file' || t.id === 'scan-file-gallery') && t.files[0]) { const file = t.files[0]; t.value = ''; handleScan(file); }
 });
 window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); deferredInstall = e; if (tab === 'settings') afterSettings(); });
 document.addEventListener('visibilitychange', () => {
