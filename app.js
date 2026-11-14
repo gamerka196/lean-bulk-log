@@ -262,7 +262,7 @@ function viewToday() {
     <div class="sugar"><span>${fmtK(t.k)} of ${fmtK(T.k)} kcal</span><span>Sugar ${fmt(t.s)} / ${T.s} g</span></div></div>`;
 
   const pd = plannedDay(d), ss = sessionOn(d);
-  html += `<button class="card coach-card" data-act="goto-train"><span class="coach-ic">${DUMBBELL_SVG}</span><span style="flex:1;min-width:0"><b>${ss ? `${esc(ss.dayName)} ${ss.finishedAt ? '✓ done' : '· in progress'}` : pd ? `Today: ${esc(pd.name)}` : 'Rest day'}</b><span class="small muted" style="display:block">${ss ? `${doneSets(ss)}/${totalSets(ss)} sets · ${fmtK(volumeOf(ss))} lb` : pd ? `${pd.exercises.length} exercises — tap to start` : 'Recover and eat — or open Train for a workout'}</span></span><span class="muted">›</span></button>`;
+  html += `<button class="card coach-card" data-act="goto-train"><span class="coach-ic">${DUMBBELL_SVG}</span><span style="flex:1;min-width:0"><b>${ss ? `${esc(ss.dayName)} ${ss.finishedAt ? '✓ done' : '· in progress'}` : pd ? `Up next: ${esc(pd.name)}` : 'Workouts'}</b><span class="small muted" style="display:block">${ss ? `${doneSets(ss)}/${totalSets(ss)} sets · ${fmtK(volumeOf(ss))} lb` : pd ? `${pd.exercises.length} exercises — tap to open Train` : 'Open Train to log a workout'}</span></span><span class="muted">›</span></button>`;
   const pLeft = T.p - t.p;
   html += `<button class="card coach-card" data-act="open-coach"><span class="coach-ic">${CHAT_SVG}</span><span style="flex:1;min-width:0"><b>Ask your coach</b><span class="small muted" style="display:block">${pLeft > 1 ? `${fmt(pLeft)} g protein to go — what should you eat?` : 'Targets covered — ask about tomorrow or a snack'}</span></span><span class="muted">›</span></button>`;
 
@@ -711,21 +711,24 @@ function coachLogItems(mi, indexes) {
 
 /* ---------- TRAIN: routine, set logging, rest timer, progress ---------- */
 const EX = (id, name, sets, variants) => ({ id, name, sets, variants: variants || [] });
+const ROUTINE_VERSION = 2; // v2: arms live only on the Arms day (no triceps on Chest, no biceps on Back)
+const ROUTINE_V1_HASH = 1551759032; // fingerprint of the untouched v1 routine, so only an unmodified one is upgraded
 const DEFAULT_ROUTINE = {
+  v: ROUTINE_VERSION,
   days: [
-    { id: 'mon', dow: 1, name: 'Chest & Triceps', exercises: [
-      EX('dips', 'Dips', 3),
-      EX('pec-deck', 'Pec deck / Incline DB press', 4, ['Pec deck', 'Incline DB press']),
+    { id: 'mon', dow: 1, name: 'Chest', exercises: [
       EX('flat-bench', 'Flat bench (variation)', 4),
+      EX('incline-db', 'Incline DB press', 4),
       EX('decline-pullover', 'Decline press / DB pullover', 4, ['Decline press', 'DB pullover']),
-      EX('oh-triceps', 'Overhead triceps / Pushdowns', 4, ['Overhead triceps press', 'Triceps pushdown']),
+      EX('pec-deck', 'Pec deck', 4),
+      EX('cable-crossover', 'Cable crossover', 4),
     ] },
-    { id: 'tue', dow: 2, name: 'Back & Biceps', exercises: [
+    { id: 'tue', dow: 2, name: 'Back', exercises: [
       EX('lat-pulldown', 'Lat pulldown', 4),
       EX('tbar-row', 'T-bar row / Barbell row', 4, ['T-bar row', 'Barbell row']),
       EX('single-arm-row', 'Single-arm row', 4),
       EX('rack-pull', 'Rack pull', 4),
-      EX('curl', 'DB curls / Barbell curls', 4, ['DB curls', 'Barbell curls']),
+      EX('seated-row', 'Seated cable row', 4),
     ] },
     { id: 'thu', dow: 4, name: 'Legs', exercises: [
       EX('leg-ext', 'Leg extension / Hamstring curl', 4, ['Leg extension', 'Hamstring curl']),
@@ -755,12 +758,36 @@ function ensureWorkouts() {
   if (!S.workouts || typeof S.workouts !== 'object') S.workouts = {};
   const w = S.workouts;
   if (!w.routine || !Array.isArray(w.routine.days)) w.routine = JSON.parse(JSON.stringify(DEFAULT_ROUTINE));
+  else if ((w.routine.v || 1) < ROUTINE_VERSION) {
+    // upgrade only if the user never edited the original routine; a customised one is left alone
+    const sig = JSON.stringify(w.routine.days.map((d) => [d.id, d.name, d.exercises.map((e) => [e.id, e.name, e.sets, (e.variants || []).join('|')])]));
+    let h = 5381; for (let i = 0; i < sig.length; i++) h = ((h << 5) + h + sig.charCodeAt(i)) | 0;
+    if (h === ROUTINE_V1_HASH) w.routine = JSON.parse(JSON.stringify(DEFAULT_ROUTINE));
+    else w.routine.v = ROUTINE_VERSION;
+  }
   w.sessions = w.sessions || {}; w.baseline = w.baseline || {}; w.prefs = w.prefs || { rest: 90 };
   return w;
 }
 const W = () => ensureWorkouts();
 const dowOf = (d) => parseYmd(d).getDay();
-const plannedDay = (d) => W().routine.days.find((x) => x.dow === dowOf(d)) || null;
+/* Rotation: the next workout is whichever day follows the one you last trained, not a fixed weekday. */
+function plannedDay(d) {
+  const w = W(), days = w.routine.days;
+  if (!days.length) return null;
+  const prior = Object.keys(w.sessions).filter((x) => x < d && doneSets(w.sessions[x]) > 0).sort().pop();
+  const i = prior ? days.findIndex((x) => x.id === w.sessions[prior].dayId) : -1;
+  return days[(i + 1) % days.length];
+}
+function lastDoneByDay() {
+  const out = {};
+  for (const d of Object.keys(W().sessions).sort()) if (doneSets(W().sessions[d]) > 0) out[W().sessions[d].dayId] = d;
+  return out;
+}
+function moveDay(id, dir) {
+  const a = W().routine.days, i = a.findIndex((x) => x.id === id), j = i + dir;
+  if (i < 0 || j < 0 || j >= a.length) return;
+  [a[i], a[j]] = [a[j], a[i]]; save();
+}
 const sessionOn = (d) => W().sessions[d] || null;
 const e1rm = (w, r) => (w > 0 && r > 0 ? w * (1 + r / 30) : 0);
 const numOf = (v) => { const n = parseFloat(String(v).replace(',', '.')); return Number.isFinite(n) ? n : 0; };
@@ -947,14 +974,17 @@ function viewTrain() {
       <div class="muted" style="margin:4px 0 12px">${n}/${totalSets(sess)} sets · ${fmtK(volumeOf(sess))} lb volume${sess.cardioMin ? ` · ${sess.cardioMin} min cardio` : ''}</div>
       <button class="btn primary block" data-act="w-open" data-d="${today}">${sess.finishedAt ? 'View / edit' : 'Continue workout'}</button></div>`;
   } else if (planned) {
-    html += `<div class="card"><h2>Today’s plan</h2><div style="font-size:19px;font-weight:700">${esc(planned.name)}</div>
-      <div class="muted small" style="margin:4px 0 12px">${planned.exercises.map((x) => esc(x.name.split(' / ')[0])).join(' · ')}</div>
-      <button class="btn primary block" data-act="w-start" data-day="${planned.id}">Start ${esc(planned.name)}</button></div>`;
-  } else {
-    html += `<div class="card"><h2>Rest day</h2><div class="muted">Nothing scheduled today. Recover, eat, and maybe take a walk. You can still start a workout below.</div></div>`;
+    const lastDone = lastDoneByDay()[planned.id];
+    html += `<div class="card"><h2>Up next</h2><div style="font-size:19px;font-weight:700">${esc(planned.name)}</div>
+      <div class="muted small" style="margin:4px 0 12px">${planned.exercises.map((x) => esc(x.name.split(' / ')[0])).join(' · ')}${lastDone ? ` · last done ${dayName(lastDone, { month: 'short', day: 'numeric' })}` : ''}</div>
+      <button class="btn primary block" data-act="w-start" data-day="${planned.id}">Start ${esc(planned.name)}</button>
+      <div class="small muted" style="margin-top:8px">Workouts follow a rotation, not the calendar. Skip a day and the next one simply waits for you.</div></div>`;
   }
-  html += `<div class="list"><div class="list-h"><h2>Your week</h2></div>${w.routine.days.map((d) =>
-    `<button class="row" data-act="w-start" data-day="${d.id}"><div class="row-main"><div class="name">${dayName(addDays(today, ((d.dow - dowOf(today) + 7) % 7)), { weekday: 'long' })} · ${esc(d.name)}</div><div class="sub">${d.exercises.length} exercises</div></div><span class="ghost" style="padding:0">Start</span></button>`).join('')}</div>`;
+  const lastBy = lastDoneByDay();
+  html += `<div class="list"><div class="list-h"><h2>Rotation</h2></div>${w.routine.days.map((d, i) => {
+    const isNext = planned && d.id === planned.id && !sess;
+    return `<button class="row" data-act="w-start" data-day="${d.id}"><div class="row-main"><div class="name">${i + 1}. ${esc(d.name)}</div><div class="sub">${d.exercises.length} exercises · ${lastBy[d.id] ? 'last ' + dayName(lastBy[d.id], { month: 'short', day: 'numeric' }) : 'not done yet'}</div></div>${isNext ? '<span class="pill on" style="padding:5px 11px;font-size:13px">Up next</span>' : '<span class="ghost" style="padding:0">Start</span>'}</button>`;
+  }).join('')}</div>`;
   const past = Object.keys(w.sessions).sort().reverse().filter((d) => d !== today || w.sessions[d].finishedAt).slice(0, 10);
   html += `<div class="list"><div class="list-h"><h2>Recent workouts</h2></div>${past.length ? past.map((d) => { const s = w.sessions[d]; return `<button class="row" data-act="sess-view" data-d="${d}"><div class="row-main"><div class="name">${esc(s.dayName)}</div><div class="sub">${dayName(d, { weekday: 'short', month: 'short', day: 'numeric' })} · ${doneSets(s)} sets</div></div><div class="row-right"><div class="kcal">${fmtK(volumeOf(s))}</div><div class="mini">lb volume</div></div></button>`; }).join('') : '<div class="empty">Your finished workouts show up here.</div>'}</div>`;
   const ids = []; w.routine.days.forEach((d) => d.exercises.forEach((x) => { if (!ids.includes(x.id)) ids.push(x.id); }));
@@ -992,10 +1022,16 @@ function sessionViewSheet(d) {
   $('#sv-del', el).onclick = () => { closeLayer(); setTimeout(() => askConfirm(`Delete this ${s.dayName} workout?`, 'Delete', () => { delete W().sessions[d]; save(); refresh(); toast('Workout deleted'); }), 280); };
 }
 
-function routineSheet() {
+function paintRoutine() {
+  const box = $('#rt-list'); if (!box) return;
   const days = W().routine.days;
-  openLayer(`<div class="sheet-title">Your routine</div><div class="muted small">Tap a day to rename it or change its exercises. History stays attached to each exercise.</div>
-    <div class="list" style="margin:12px 0 0">${days.map((d) => `<button class="row" data-act="edit-day" data-id="${d.id}"><div class="row-main"><div class="name">${dayName(addDays(todayStr(), ((d.dow - dowOf(todayStr()) + 7) % 7)), { weekday: 'long' })} · ${esc(d.name)}</div><div class="sub">${d.exercises.map((x) => esc(x.name.split(' / ')[0])).join(', ')}</div></div><span class="muted">›</span></button>`).join('')}</div>`);
+  box.innerHTML = days.map((d, i) => `<div class="row"><button class="row-main" data-act="edit-day" data-id="${d.id}" style="text-align:left"><div class="name">${i + 1}. ${esc(d.name)}</div><div class="sub">${d.exercises.map((x) => esc(x.name.split(' / ')[0])).join(', ')}</div></button>
+    <div class="rx-btns" style="margin:0"><button data-act="day-move" data-id="${d.id}" data-dir="-1" aria-label="Move earlier" ${i === 0 ? 'disabled' : ''}>↑</button><button data-act="day-move" data-id="${d.id}" data-dir="1" aria-label="Move later" ${i === days.length - 1 ? 'disabled' : ''}>↓</button></div></div>`).join('');
+}
+function routineSheet() {
+  openLayer(`<div class="sheet-title">Your rotation</div><div class="muted small">Workouts repeat in this order, whatever day of the week it is. Use ↑ ↓ to reorder, or tap a day to rename it or change its exercises. History stays attached to each exercise.</div>
+    <div class="list" style="margin:12px 0 0" id="rt-list"></div>`);
+  paintRoutine();
 }
 function editDaySheet(dayId) {
   const day = W().routine.days.find((d) => d.id === dayId); if (!day) return;
@@ -1046,7 +1082,7 @@ function workoutContext(date) {
   const w = W(), planned = plannedDay(date), s = sessionOn(date);
   const last7 = [...Array(7)].map((_, i) => addDays(todayStr(), -i)).filter((d) => w.sessions[d] && doneSets(w.sessions[d])).map((d) => ({ date: d, workout: w.sessions[d].dayName, sets: doneSets(w.sessions[d]), volume_lb: Math.round(volumeOf(w.sessions[d])) }));
   return {
-    plannedToday: planned ? planned.name : 'rest day',
+    nextInRotation: planned ? planned.name : null,
     today: s ? { workout: s.dayName, finished: !!s.finishedAt, sets_done: doneSets(s), volume_lb: Math.round(volumeOf(s)), cardio_min: s.cardioMin || 0, exercises: s.exercises.filter((e) => e.sets.some((x) => x.done)).map((e) => ({ name: e.variant || e.name, sets: setTxt(e.sets.filter((x) => x.done)) })) } : null,
     last7Days: last7,
   };
@@ -1298,6 +1334,7 @@ const actions = {
   'ex-progress': (el) => exProgressSheet(el.dataset.id),
   'sess-view': (el) => sessionViewSheet(el.dataset.d),
   'edit-routine': () => routineSheet(),
+  'day-move': (el) => { moveDay(el.dataset.id, +el.dataset.dir); paintRoutine(); refresh(); },
   'edit-day': (el) => { const id = el.dataset.id; closeLayer(); setTimeout(() => editDaySheet(id), 280); },
   'export-workouts': () => exportWorkoutsCsv(),
   'open-coach': () => openCoach(),

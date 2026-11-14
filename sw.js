@@ -1,5 +1,5 @@
 // Offline cache: serve from cache instantly, refresh it in the background.
-const V = 'lbl-v7';
+const V = 'lbl-v9';
 const SHELL = [
   './', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'seed.json',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png', 'icons/apple-touch-icon.png',
