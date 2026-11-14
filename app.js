@@ -631,6 +631,7 @@ function viewSettings() {
     <button class="btn block" style="margin-top:8px" data-act="merge-json">Import history (keep my data)…</button>
     <div class="small muted" style="margin-top:6px"><b>Restore</b> replaces everything. <b>Import history</b> only adds what’s missing — use it to load an old backup without losing newer logs.</div>
     <input type="file" id="merge-file" accept=".json,application/json" hidden>
+    ${(() => { const p = readPrev(); return p && p.data ? `<button class="btn block" style="margin-top:8px;color:var(--warn)" data-act="undo-import">Undo last ${esc(p.label)} · ${new Date(p.ts).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</button>` : ''; })()}
     <button class="btn block" style="margin-top:8px" data-act="export-csv">Export log for Excel (CSV)</button>
     <input type="file" id="import-file" accept=".json,application/json" hidden>
     <div class="small muted" style="margin-top:10px" id="persist-note"></div></div>
@@ -666,8 +667,23 @@ function exportCsv() {
   download(`lean-bulk-log-${todayStr()}.csv`, '﻿' + rows.map((r) => r.map(q).join(',')).join('\r\n'), 'text/csv');
   toast('CSV exported');
 }
+/* Safety net: a copy of everything is kept just before any restore/import, so it can always be undone. */
+const PREV_KEY = 'lbl.prev';
+function snapshotBefore(label) {
+  try { localStorage.setItem(PREV_KEY, JSON.stringify({ ts: Date.now(), label, data: S })); } catch (e) { /* storage full: in-session undo still works */ }
+}
+function readPrev() { try { return JSON.parse(localStorage.getItem(PREV_KEY)); } catch (e) { return null; } }
+function undoImport() {
+  const p = readPrev();
+  if (!p || !p.data || !Array.isArray(p.data.foods)) { toast('Nothing to undo'); return; }
+  S = p.data;
+  try { localStorage.removeItem(PREV_KEY); } catch (e) { /* ignore */ }
+  save(); viewDate = todayStr(); refresh(); toast(`Undid the ${p.label} — your data is back`);
+}
+
 /* Merge a backup INTO the current data: nothing existing is removed or changed. Safe to run twice. */
 function mergeBackup(o) {
+  snapshotBefore('history import');
   const snap = JSON.stringify(S);
   const key = (s) => String(s).trim().toLowerCase();
   const byName = new Map(S.foods.map((f) => [key(f.name), f]));
@@ -716,7 +732,12 @@ function importJson(file, merge = false) {
         askConfirm(`Add up to ${days} logged days and any foods you don’t have yet from this file? Everything already in the app stays.`, 'Merge', () => mergeBackup(o));
         return;
       }
-      askConfirm(`Replace everything in the app with this backup (${o.foods.length} foods, ${Object.keys(o.log).length} days)?`, 'Restore', () => { S = o; save(); viewDate = todayStr(); refresh(); toast('Backup restored'); });
+      const mine = Object.values(S.log).filter((a) => a && a.length).length;
+      askConfirm(`Restore will ERASE what’s in the app now (${mine} logged days, ${S.foods.length} foods) and replace it with this backup (${Object.keys(o.log).length} days, ${o.foods.length} foods). To keep your current data, use “Import history” instead.`, 'Restore anyway', () => {
+        snapshotBefore('restore');
+        S = o; save(); viewDate = todayStr(); refresh();
+        toast('Backup restored', () => undoImport());
+      });
     } catch (e) { toast('That file is not a Lean Bulk Log backup'); }
   };
   rd.readAsText(file);
@@ -754,6 +775,7 @@ const actions = {
   'export-csv': () => exportCsv(),
   'import-json': () => $('#import-file').click(),
   'merge-json': () => $('#merge-file').click(),
+  'undo-import': () => askConfirm('Undo the last import and go back to exactly what the app held before it?', 'Undo', () => undoImport()),
   'scan-label': () => { if (scanReady()) scanPick(false); else scanSetupSheet(); },
   'scan-retry': () => { closeLayer(); setTimeout(() => scanPick(false), 280); },
   'scan-gallery': () => { closeLayer(); setTimeout(() => scanPick(true), 280); },
