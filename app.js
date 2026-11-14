@@ -542,18 +542,20 @@ async function handleScan(file) {
     closeLayer();
     setTimeout(() => openFoodForm(null, { fromAdd, prefill, banner, photo: photoUrl }), 280);
   } catch (e) {
-    fail(e.name === 'AbortError' ? 'Took too long — check your connection and try again.' : e instanceof TypeError ? 'Couldn’t reach the scan server — check your connection and the proxy address in Settings.' : 'Something went wrong reading the photo.');
+    fail(e.name === 'AbortError' ? 'Took too long — check your connection and try again.' : e instanceof TypeError ? `Couldn’t reach the scan server (${e.message}). Run Test connection in Settings to see what’s wrong.` : 'Something went wrong reading the photo.');
   }
 }
 
 async function testScanner(btn) {
   const c = scanCfg(), out = $('#scan-test-result');
   if (!c.url || !c.token) { out.textContent = 'Enter the proxy address and token first.'; return; }
+  if (!/^https:\/\/[^\s/]+(\/\S*)?$/i.test(c.url)) { out.textContent = `✗ The address must start with https:// and contain no spaces. It currently reads: ${c.url.slice(0, 70)}`; return; }
+  if (!/^[\x21-\x7e]+$/.test(c.token)) { out.textContent = '✗ The token contains a character that is not allowed (copy/paste added something odd). Clear the field and paste it again.'; return; }
   btn.disabled = true; out.textContent = 'Testing…';
   try {
     const r = await fetch(c.url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': c.token }, body: '{}' });
-    out.textContent = r.status === 401 ? '✗ The proxy rejected your app token.' : r.status === 413 ? '✓ Connected — the proxy accepted your token.' : r.status === 403 ? '✗ The proxy does not allow this website (check ALLOWED_ORIGIN).' : `Unexpected reply (${r.status}).`;
-  } catch (e) { out.textContent = '✗ Could not reach that address.'; }
+    out.textContent = r.status === 401 ? '✗ The proxy rejected your app token (wrong or mistyped).' : r.status === 413 ? '✓ Connected — the proxy accepted your token.' : r.status === 403 ? '✗ The proxy does not allow this website (check ALLOWED_ORIGIN).' : `Unexpected reply (${r.status}).`;
+  } catch (e) { out.textContent = `✗ Could not reach ${new URL(c.url).host} (${e.message || e.name}). Check the address, your connection, and any VPN or Private DNS.`; }
   btn.disabled = false;
 }
 
@@ -727,7 +729,7 @@ document.addEventListener('change', (e) => {
     if (Number.isFinite(v) && v >= 0) { S.targets[t.dataset.t] = v; save(); const T = S.targets; $('#macro-hint').innerHTML = hint(T.p * 4 + T.c * 4 + T.f * 9, T.k); }
   }
   if (t.id === 'import-file' && t.files[0]) { importJson(t.files[0]); t.value = ''; }
-  if (t.dataset && t.dataset.scan) { const c = scanCfg(); c[t.dataset.scan] = t.value.trim(); setScanCfg(c); }
+  if (t.dataset && t.dataset.scan) { const clean = t.value.replace(/\s+/g, ''); t.value = clean; const c = scanCfg(); c[t.dataset.scan] = clean; setScanCfg(c); }
   if ((t.id === 'scan-file' || t.id === 'scan-file-gallery') && t.files[0]) { const file = t.files[0]; t.value = ''; handleScan(file); }
 });
 window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); deferredInstall = e; if (tab === 'settings') afterSettings(); });
