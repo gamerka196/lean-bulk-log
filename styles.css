@@ -184,17 +184,20 @@ b { font-weight: 650; }
 .ghost.sm0 { padding: 4px 6px; font-size: 13px; }
 .pill.sm1 { padding: 6px 11px; font-size: 13px; }
 .xlast { font-size: 12.5px; color: var(--muted); margin: 2px 0 8px; }
-.set { display: grid; grid-template-columns: 20px 1fr 1fr 46px; gap: 6px; align-items: center; margin: 6px 0; padding: 4px; border-radius: 14px; border: 1px solid transparent; }
-.set.done { background: color-mix(in srgb, var(--accent) 14%, var(--card)); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
-.set-n { color: var(--muted); font-size: 13px; text-align: center; }
-.stp { display: flex; align-items: center; gap: 3px; min-width: 0; }
-.stp button { width: 32px; height: 44px; border-radius: 11px; background: var(--card2); border: 1px solid var(--line); font-size: 20px; flex: none; }
-.stp button:active { background: var(--line); }
-.stp input { flex: 1; min-width: 0; width: 100%; height: 44px; text-align: center; font-size: 18px; font-weight: 650; border-radius: 11px; border: 1px solid var(--line); background: var(--card2); outline: none; padding: 0 2px; }
-.stp input:focus { border-color: var(--accent); }
-.chk { width: 46px; height: 44px; border-radius: 13px; background: var(--card2); border: 1px solid var(--line); font-size: 22px; color: var(--muted); }
-.set.done .chk { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
-.xfoot { display: flex; gap: 8px; margin-top: 8px; }
+/* one compact grid per exercise: a column per set, weights row like the spreadsheet, reps row underneath */
+.sgrid { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+.sgrid .lbls, .scol { display: grid; grid-template-rows: 22px 48px 48px 46px; gap: 6px; padding: 4px 3px; border: 1px solid transparent; border-radius: 14px; align-items: center; }
+.sgrid .lbls { width: 34px; flex: none; padding-left: 0; padding-right: 0; color: var(--muted); font-size: 12px; text-align: left; }
+.scol { flex: 1; min-width: 60px; text-align: center; }
+.scol.done { background: color-mix(in srgb, var(--accent) 14%, var(--card)); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.scol .sn { color: var(--muted); font-size: 12.5px; }
+.scol input { width: 100%; min-width: 0; height: 48px; padding: 0; text-align: center; font-size: 20px; font-weight: 650; border-radius: 12px; border: 1px solid var(--line); background: var(--card2); outline: none; }
+.scol input:focus { border-color: var(--accent); }
+.chk { height: 46px; border-radius: 13px; background: var(--card2); border: 1px solid var(--line); font-size: 22px; color: var(--muted); width: 100%; }
+.scol.done .chk { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.xfoot { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.xfoot .btn.sm { padding: 8px 8px; font-size: 13px; flex: 1 1 auto; white-space: nowrap; }
+.xfoot .btn.primary { flex: 1.5 1 auto; }
 .rest-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 14px calc(10px + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--line); }
 .rest-bar[hidden] { display: none; }
 .rest-bar.over { background: color-mix(in srgb, var(--accent) 22%, var(--card)); }

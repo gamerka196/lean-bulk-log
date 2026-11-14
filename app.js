@@ -711,8 +711,11 @@ function coachLogItems(mi, indexes) {
 
 /* ---------- TRAIN: routine, set logging, rest timer, progress ---------- */
 const EX = (id, name, sets, variants) => ({ id, name, sets, variants: variants || [] });
-const ROUTINE_VERSION = 2; // v2: arms live only on the Arms day (no triceps on Chest, no biceps on Back)
-const ROUTINE_V1_HASH = 1551759032; // fingerprint of the untouched v1 routine, so only an unmodified one is upgraded
+const ROUTINE_VERSION = 3; // v3: no abs; v2: arms live only on the Arms day
+const OLD_ROUTINE_HASHES = [1551759032, -964817554]; // fingerprints of the untouched v1/v2 routines: only an unedited routine gets upgraded
+const DEFAULT_REPS = [12, 10, 8, 8]; // rep target per set until you set your own (Train -> Routine)
+const repsFor = (ex, i) => { const a = ex.reps && ex.reps.length ? ex.reps : DEFAULT_REPS; return a[i] !== undefined ? a[i] : a[a.length - 1]; };
+const repsList = (ex) => Array.from({ length: ex.sets }, (_, i) => repsFor(ex, i));
 const DEFAULT_ROUTINE = {
   v: ROUTINE_VERSION,
   days: [
@@ -744,12 +747,11 @@ const DEFAULT_ROUTINE = {
       EX('face-pull', 'Cable face pulls', 4),
       EX('shrugs', 'Shrugs', 4),
     ] },
-    { id: 'sat', dow: 6, name: 'Arms & Abs', exercises: [
+    { id: 'sat', dow: 6, name: 'Arms', exercises: [
       EX('close-grip', 'Close-grip bench / Biceps curl', 4, ['Close-grip bench', 'Biceps curl']),
       EX('oh-triceps', 'Overhead triceps / Pushdowns', 4, ['Overhead triceps press', 'Triceps pushdown']),
       EX('curl', 'DB curls / Barbell curls', 4, ['DB curls', 'Barbell curls']),
       EX('hammer', 'Hammer curls', 4),
-      EX('leg-raise', 'Hanging leg raises', 4),
     ] },
   ],
 };
@@ -762,7 +764,7 @@ function ensureWorkouts() {
     // upgrade only if the user never edited the original routine; a customised one is left alone
     const sig = JSON.stringify(w.routine.days.map((d) => [d.id, d.name, d.exercises.map((e) => [e.id, e.name, e.sets, (e.variants || []).join('|')])]));
     let h = 5381; for (let i = 0; i < sig.length; i++) h = ((h << 5) + h + sig.charCodeAt(i)) | 0;
-    if (h === ROUTINE_V1_HASH) w.routine = JSON.parse(JSON.stringify(DEFAULT_ROUTINE));
+    if (OLD_ROUTINE_HASHES.includes(h)) w.routine = JSON.parse(JSON.stringify(DEFAULT_ROUTINE));
     else w.routine.v = ROUTINE_VERSION;
   }
   w.sessions = w.sessions || {}; w.baseline = w.baseline || {}; w.prefs = w.prefs || { rest: 90 };
@@ -832,7 +834,7 @@ function prefillSets(ex, v, date, n) {
     const l = last ? (last[i] || last[last.length - 1]) : null;
     const b = base && base.length ? (base[i] !== undefined ? base[i] : base[base.length - 1]) : null;
     const w = l ? l.w : b !== null && b !== undefined ? b : pw;
-    const r = l ? l.r : pr;
+    const r = l ? l.r : repsFor(ex, i); // last session's reps, else the exercise's rep scheme (12/10/8/8 by default)
     out.push({ w, r, done: false });
     pw = w; pr = r;
   }
@@ -881,14 +883,6 @@ function updateWorkoutClock() {
   if (sub) sub.textContent = `${dayName(workoutDate, { weekday: 'short', month: 'short', day: 'numeric' })} · ${s.finishedAt ? 'finished' : mins + ' min'} · ${doneSets(s)}/${totalSets(s)} sets`;
 }
 
-function setRow(e, ei, st, si) {
-  return `<div class="set ${st.done ? 'done' : ''}" data-ei="${ei}" data-si="${si}">
-    <span class="set-n">${si + 1}</span>
-    <div class="stp"><button data-act="w-step" data-f="w" data-d="-1" aria-label="Less weight">−</button><input data-f="w" inputmode="decimal" value="${esc(st.w)}" placeholder="lb"><button data-act="w-step" data-f="w" data-d="1" aria-label="More weight">+</button></div>
-    <div class="stp"><button data-act="w-step" data-f="r" data-d="-1" aria-label="Fewer reps">−</button><input data-f="r" inputmode="numeric" value="${esc(st.r)}" placeholder="reps"><button data-act="w-step" data-f="r" data-d="1" aria-label="More reps">+</button></div>
-    <button class="chk" data-act="w-done" aria-label="Mark set done">✓</button></div>`;
-}
-
 function exerciseCard(s, e, ei) {
   const ex = findExercise(e.exId), variants = ex ? ex.variants : [];
   const last = priorSets(e.exId, e.variant, workoutDate), base = W().baseline[e.exId];
@@ -897,8 +891,18 @@ function exerciseCard(s, e, ei) {
     <div class="xhead"><b>${esc(e.variant || e.name)}</b><button class="ghost sm0" data-act="ex-progress" data-id="${esc(e.exId)}">History</button></div>
     ${variants.length > 1 ? `<div class="chips" style="margin:6px 0">${variants.map((v) => `<button class="pill sm1 ${v === e.variant ? 'on' : ''}" data-act="w-variant" data-v="${esc(v)}">${esc(v)}</button>`).join('')}</div>` : ''}
     <div class="xlast">${esc(hint)}</div>
-    ${e.sets.map((st, si) => setRow(e, ei, st, si)).join('')}
-    <div class="xfoot"><button class="btn sm" data-act="w-addset">+ Set</button><button class="btn sm" data-act="w-delset">− Set</button></div></div>`;
+    <div class="sgrid">
+      <div class="lbls"><span></span><span>lb</span><span>reps</span><span></span></div>
+      ${e.sets.map((st, si) => `<div class="scol ${st.done ? 'done' : ''}" data-si="${si}"><span class="sn">${si + 1}</span>
+        <input data-f="w" inputmode="decimal" enterkeyhint="next" value="${esc(st.w)}" placeholder="–" aria-label="Weight, set ${si + 1}">
+        <input data-f="r" inputmode="numeric" enterkeyhint="next" value="${esc(st.r)}" placeholder="–" aria-label="Reps, set ${si + 1}">
+        <button class="chk" data-act="w-done" aria-label="Mark set ${si + 1} done">✓</button></div>`).join('')}
+    </div>
+    <div class="xfoot"><button class="btn primary sm" data-act="w-all">${e.sets.length && e.sets.every((x) => x.done) ? 'Undo all' : 'All sets ✓'}</button><button class="btn sm" data-act="w-bump" data-d="5">+5 lb</button><button class="btn sm" data-act="w-bump" data-d="-5">−5 lb</button><button class="btn sm" data-act="w-addset">+ Set</button><button class="btn sm" data-act="w-delset">− Set</button></div></div>`;
+}
+function repaintCard(ei) {
+  const s = sessionOn(workoutDate), card = workoutEl && $$('.xcard', workoutEl)[ei];
+  if (s && card) card.outerHTML = exerciseCard(s, s.exercises[ei], ei);
 }
 
 function renderWorkout() {
@@ -930,29 +934,37 @@ function restUpdate() {
   setTimeout(() => { if (Date.now() >= restEnd + 3500 && bar) bar.hidden = true; }, 4000);
 }
 
-function stepSet(row, f, dir) {
-  const s = sessionOn(workoutDate), set = s.exercises[+row.dataset.ei].sets[+row.dataset.si];
-  const cur = numOf(set[f]);
-  const step = f === 'r' ? 1 : cur > 0 && cur < 30 ? 2.5 : 5;
-  const next = Math.max(0, Math.round((cur + dir * step) * 100) / 100);
-  set[f] = next === 0 && f === 'w' ? '' : String(next);
-  $(`input[data-f="${f}"]`, row).value = set[f];
-  saveSoon();
-}
+function prToast(e, set) { toast(`🏆 New PR · ${e.variant || e.name}: ${fmt(numOf(set.w))} × ${fmt(numOf(set.r))}`); }
 
-function toggleDone(row) {
-  const s = sessionOn(workoutDate), e = s.exercises[+row.dataset.ei], si = +row.dataset.si, set = e.sets[si];
-  if (set.done) { set.done = false; row.classList.remove('done'); save(); updateWorkoutClock(); return; }
-  if (numOf(set.r) <= 0) { toast('Enter the reps first'); $('input[data-f="r"]', row).focus(); return; }
+function toggleDone(col) {
+  const card = col.closest('.xcard'), ei = +card.dataset.ei, s = sessionOn(workoutDate), e = s.exercises[ei], si = +col.dataset.si, set = e.sets[si];
+  if (set.done) { set.done = false; save(); repaintCard(ei); updateWorkoutClock(); return; }
+  if (numOf(set.r) <= 0) { toast('Enter the reps first'); $('input[data-f="r"]', col).focus(); return; }
   const had = bestE1rm(e.exId, e.variant, workoutDate);
   const prev = Math.max(had, ...e.sets.filter((x, i) => x.done && i !== si).map((x) => e1rm(numOf(x.w), numOf(x.r))));
-  set.done = true; row.classList.add('done');
-  // carry weight/reps forward to the next untouched set so one tap logs the next one
-  const nxt = e.sets[si + 1];
+  set.done = true;
+  const nxt = e.sets[si + 1]; // carry the weight forward if the next set is still empty
   if (nxt && !nxt.done && nxt.w === '' && set.w !== '') nxt.w = set.w;
-  save(); updateWorkoutClock();
-  if (had > 0 && e1rm(numOf(set.w), numOf(set.r)) > prev) toast(`🏆 New PR · ${e.variant || e.name}: ${fmt(numOf(set.w))} × ${fmt(numOf(set.r))}`);
+  save(); repaintCard(ei); updateWorkoutClock();
+  if (had > 0 && e1rm(numOf(set.w), numOf(set.r)) > prev) prToast(e, set);
   startRest(W().prefs.rest);
+}
+
+/* one tap logs the whole exercise exactly as shown (the usual case); edit any box first if a set differed */
+function markAll(ei) {
+  const s = sessionOn(workoutDate), e = s.exercises[ei];
+  if (e.sets.every((x) => x.done)) { e.sets.forEach((x) => { x.done = false; }); save(); repaintCard(ei); updateWorkoutClock(); return; }
+  if (e.sets.some((x) => !x.done && numOf(x.r) <= 0)) { toast('A set has no reps — fill it in, or remove the set'); return; }
+  const had = bestE1rm(e.exId, e.variant, workoutDate);
+  let top = null;
+  for (const x of e.sets) { if (!x.done) x.done = true; if (!top || e1rm(numOf(x.w), numOf(x.r)) > e1rm(numOf(top.w), numOf(top.r))) top = x; }
+  save(); repaintCard(ei); updateWorkoutClock();
+  if (had > 0 && top && e1rm(numOf(top.w), numOf(top.r)) > had) prToast(e, top);
+}
+function bumpWeights(ei, d) {
+  const e = sessionOn(workoutDate).exercises[ei];
+  for (const x of e.sets) if (!x.done && numOf(x.w) > 0) x.w = String(Math.max(0, Math.round((numOf(x.w) + d) * 100) / 100));
+  save(); repaintCard(ei);
 }
 
 function finishSheet() {
@@ -1043,10 +1055,10 @@ function editDaySheet(dayId) {
     <div class="muted small" style="margin:10px 0">Variants: separate with commas to alternate between versions week to week (e.g. “T-bar row, Barbell row”).</div>
     <div class="btn-row"><button class="btn primary" id="rd-save">Save</button></div>`);
   const list = $('#rd-list', el);
-  const read = () => { draft.name = $('#rd-name', el).value.trim() || day.name; $$('.rx', el).forEach((box, i) => { const e = draft.exercises[i]; e.name = $('.rx-name', box).value.trim() || e.name; e.sets = Math.min(10, Math.max(1, parseInt($('.rx-sets', box).value, 10) || e.sets)); e.variants = $('.rx-var', box).value.split(',').map((x) => x.trim()).filter(Boolean); }); };
+  const read = () => { draft.name = $('#rd-name', el).value.trim() || day.name; $$('.rx', el).forEach((box, i) => { const e = draft.exercises[i]; e.name = $('.rx-name', box).value.trim() || e.name; const reps = $('.rx-reps', box).value.split(/[^0-9]+/).map(Number).filter((n) => n > 0).slice(0, 8); if (reps.length) { e.reps = reps; e.sets = reps.length; } e.variants = $('.rx-var', box).value.split(',').map((x) => x.trim()).filter(Boolean); }); };
   const paint = () => {
     list.innerHTML = draft.exercises.map((e, i) => `<div class="rx" data-i="${i}"><input class="rx-name" value="${esc(e.name)}" aria-label="Exercise name">
-      <div class="rx-row"><label>Sets<input class="rx-sets" type="number" min="1" max="10" value="${e.sets}"></label><label style="flex:1">Variants (optional)<input class="rx-var" value="${esc(e.variants.join(', '))}"></label></div>
+      <div class="rx-row"><label style="width:46%">Reps per set<input class="rx-reps" inputmode="numeric" placeholder="12, 10, 8, 8" value="${esc(repsList(e).join(', '))}"></label><label style="flex:1">Variants (optional)<input class="rx-var" value="${esc(e.variants.join(', '))}"></label></div>
       <div class="rx-btns"><button data-rx="up">↑ Up</button><button data-rx="down">↓ Down</button><button data-rx="del" style="color:var(--danger)">✕ Remove</button></div></div>`).join('');
   };
   paint();
@@ -1318,8 +1330,9 @@ const actions = {
   'w-start': (el) => startSession(el.dataset.day, todayStr()),
   'w-open': (el) => openWorkout(el.dataset.d),
   'w-finish': () => finishSheet(),
-  'w-step': (el) => stepSet(el.closest('.set'), el.dataset.f, +el.dataset.d),
-  'w-done': (el) => toggleDone(el.closest('.set')),
+  'w-done': (el) => toggleDone(el.closest('.scol')),
+  'w-all': (el) => markAll(+el.closest('.xcard').dataset.ei),
+  'w-bump': (el) => bumpWeights(+el.closest('.xcard').dataset.ei, +el.dataset.d),
   'w-variant': (el) => {
     const s = sessionOn(workoutDate), ei = +el.closest('.xcard').dataset.ei, e = s.exercises[ei], ex = findExercise(e.exId);
     if (e.variant === el.dataset.v) return;
@@ -1359,11 +1372,19 @@ document.addEventListener('click', (e) => {
 document.addEventListener('input', (e) => {
   const t = e.target;
   if (t.id === 'food-q') { foodQ = t.value; renderFoodList(); }
-  if (workoutEl && t.dataset && t.dataset.f && t.closest('.set')) {
-    const row = t.closest('.set'), s = sessionOn(workoutDate);
-    if (s) { s.exercises[+row.dataset.ei].sets[+row.dataset.si][t.dataset.f] = t.value.replace(',', '.'); saveSoon(); }
+  if (workoutEl && t.dataset && t.dataset.f && t.closest('.scol')) {
+    const col = t.closest('.scol'), card = t.closest('.xcard'), s = sessionOn(workoutDate);
+    if (s) { s.exercises[+card.dataset.ei].sets[+col.dataset.si][t.dataset.f] = t.value.replace(',', '.'); saveSoon(); }
   }
   if (t.id === 'w-cardio' && workoutEl) { const s = sessionOn(workoutDate); if (s) { s.cardioMin = parseInt(t.value, 10) || 0; saveSoon(); } }
+});
+// Enter jumps to the same box in the next set (type a whole weights line, like your sheet)
+document.addEventListener('keydown', (e) => {
+  const t = e.target;
+  if (e.key !== 'Enter' || !workoutEl || !t.dataset || !t.dataset.f || !t.closest('.scol')) return;
+  e.preventDefault();
+  const next = t.closest('.scol').nextElementSibling && $(`input[data-f="${t.dataset.f}"]`, t.closest('.scol').nextElementSibling);
+  if (next) { next.focus(); next.select(); } else t.blur();
 });
 document.addEventListener('change', (e) => {
   const t = e.target;
