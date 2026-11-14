@@ -135,7 +135,11 @@ function openLayer(html, { full = false } = {}) {
 function removeTopLayer() {
   const el = layers.pop();
   if (!el) return;
-  if (el.classList.contains('full')) { document.body.classList.remove('has-add'); addEl = null; }
+  if (el.classList.contains('full')) {
+    document.body.classList.remove('has-add');
+    if (el === addEl) addEl = null;
+    if (el === coachEl) coachEl = null;
+  }
   el.classList.remove('show');
   setTimeout(() => el.remove(), 230);
 }
@@ -200,6 +204,7 @@ function copyDay(from, to = viewDate) {
 function refresh() {
   render();
   if (addEl) renderAddFoot();
+  if (coachEl) renderCoachHead();
 }
 function render() {
   $$('#tabbar button').forEach((b) => b.classList.toggle('on', b.dataset.tab === tab));
@@ -250,6 +255,9 @@ function viewToday() {
       <div class="ringtxt"><b>${fmtK(Math.abs(left))}</b><span>${over ? 'kcal over' : 'kcal left'}</span></div></div>
     <div class="macros">${mac('p', 'Protein')}${mac('c', 'Carbs')}${mac('f', 'Fat')}</div></div>
     <div class="sugar"><span>${fmtK(t.k)} of ${fmtK(T.k)} kcal</span><span>Sugar ${fmt(t.s)} / ${T.s} g</span></div></div>`;
+
+  const pLeft = T.p - t.p;
+  html += `<button class="card coach-card" data-act="open-coach"><span class="coach-ic">${CHAT_SVG}</span><span style="flex:1;min-width:0"><b>Ask your coach</b><span class="small muted" style="display:block">${pLeft > 1 ? `${fmt(pLeft)} g protein to go — what should you eat?` : 'Targets covered — ask about tomorrow or a snack'}</span></span><span class="muted">›</span></button>`;
 
   if (S.supps.length) {
     html += `<div class="card"><h2>Supplements</h2><div class="chips">${S.supps.map((s) =>
@@ -363,7 +371,9 @@ function openFoodForm(food, { fromAdd = false, prefill = null, banner = '', phot
   });
 }
 
-const CAMERA_SVG = '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>';
+const CHAT_SVG = '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v11H9l-5 4z"/><path d="M8 9.5h8M8 12.5h5"/></svg>';
+const SEND_SVG = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V6M6 11l6-6 6 6"/></svg>';
+const CAMERA_SVG ='<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>';
 
 /* ---------- ADD FLOW ---------- */
 let addEl = null;
@@ -500,8 +510,8 @@ function scannedToForm(x) {
 }
 
 function scanSetupSheet() {
-  openLayer(`<div class="sheet-title">Set up label scanning</div>
-    <div class="muted" style="margin:6px 0 12px">Scanning needs a small proxy that holds your Claude API key (one-time setup, steps in the README). Then paste its address and your app token under <b>Settings → Label scanner</b>.</div>
+  openLayer(`<div class="sheet-title">Set up the AI features</div>
+    <div class="muted" style="margin:6px 0 12px">Label scanning and the coach need a small proxy that holds your Claude API key (one-time setup, steps in the README). Then paste its address and your app token under <b>Settings → AI proxy</b>.</div>
     <div class="btn-row"><button class="btn" data-act="close-layer">Not now</button><button class="btn primary" data-act="scan-go-settings">Open settings</button></div>`);
 }
 
@@ -557,6 +567,137 @@ async function testScanner(btn) {
     out.textContent = r.status === 401 ? '✗ The proxy rejected your app token (wrong or mistyped).' : r.status === 413 ? '✓ Connected — the proxy accepted your token.' : r.status === 403 ? '✗ The proxy does not allow this website (check ALLOWED_ORIGIN).' : `Unexpected reply (${r.status}).`;
   } catch (e) { out.textContent = `✗ Could not reach ${new URL(c.url).host} (${e.message || e.name}). Check the address, your connection, and any VPN or Private DNS.`; }
   btn.disabled = false;
+}
+
+/* ---------- COACH: chat with Claude about what to eat next ---------- */
+const COACH_KEY = 'lbl.coach'; // conversation lives outside the main state/backups; one conversation per day
+let coachEl = null, coachBusy = false, coachDate = null;
+let coachMsgs = []; // { role: 'user'|'ai', text, suggestions?: [{food_id, qty, note}], logged?: {idx: true}, error?: true }
+const COACH_PROMPTS = ['What should I eat next?', 'How’s my day looking?', 'Easiest way to hit my protein', 'Late-night snack ideas', 'Something quick and cheap'];
+
+function coachLoad(date) {
+  try { const o = JSON.parse(localStorage.getItem(COACH_KEY)); coachMsgs = o && o.date === date && Array.isArray(o.msgs) ? o.msgs : []; } catch (e) { coachMsgs = []; }
+}
+function coachSave() {
+  try { localStorage.setItem(COACH_KEY, JSON.stringify({ date: coachDate, msgs: coachMsgs.slice(-40) })); } catch (e) { /* conversation just won't persist */ }
+}
+
+function coachContext(date) {
+  const T = S.targets, es = entriesOf(date), t = totalsOf(es), r = (n) => Math.round(n * 10) / 10;
+  const days = [...Array(7)].map((_, i) => addDays(todayStr(), -i - 1)).filter((d) => (S.log[d] || []).length);
+  const avg = (m) => days.reduce((a, d) => a + dayTotals(d)[m], 0) / days.length;
+  return {
+    date, isToday: date === todayStr(), localTime: new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }), goal: 'lean bulk',
+    targets: { kcal: T.k, protein_g: T.p, carbs_g: T.c, fat_g: T.f, sugar_limit_g: T.s },
+    eaten: { kcal: Math.round(t.k), protein_g: r(t.p), carbs_g: r(t.c), fat_g: r(t.f), sugar_g: r(t.s) },
+    remaining: { kcal: Math.round(T.k - t.k), protein_g: r(T.p - t.p), carbs_g: r(T.c - t.c), fat_g: r(T.f - t.f) },
+    logged: es.map((e) => ({ food: e.name, amount: amountLabel(e), kcal: Math.round(e.per.k * e.qty), protein_g: r(e.per.p * e.qty), carbs_g: r(e.per.c * e.qty), fat_g: r(e.per.f * e.qty) })),
+    supplementsTaken: (S.suppLog[date] || []).map((id) => (S.supps.find((s) => s.id === id) || {}).name).filter(Boolean),
+    last7DaysAverage: days.length ? { days_logged: days.length, kcal: Math.round(avg('k')), protein_g: r(avg('p')) } : null,
+    favouriteFoodIds: favourites(14),
+    foods: S.foods.map((f) => ({ id: f.id, name: f.name, serving: f.serving, category: f.cat, kcal: f.k, protein_g: f.p, carbs_g: f.c, fat_g: f.f, usual_servings: usualQty(f.id) })),
+  };
+}
+
+const chatUrl = () => scanCfg().url.replace(/\/+$/, '') + '/chat';
+
+async function coachSend(text) {
+  text = String(text || '').trim();
+  if (!text || coachBusy) return;
+  if (!scanReady()) { scanSetupSheet(); return; }
+  coachMsgs.push({ role: 'user', text });
+  coachBusy = true; coachSave(); renderCoachBody(true);
+  const cfg = scanCfg();
+  const messages = coachMsgs.filter((m) => !m.error).slice(-12).map((m) => ({ role: m.role === 'ai' ? 'assistant' : 'user', content: m.text.slice(0, 1900) }));
+  while (messages.length && messages[0].role !== 'user') messages.shift();
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 90000);
+    let res;
+    try {
+      res = await fetch(chatUrl(), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': cfg.token }, body: JSON.stringify({ messages, context: coachContext(coachDate) }), signal: ctrl.signal });
+    } finally { clearTimeout(timer); }
+    const data = await res.json().catch(() => null);
+    if (!data || !data.ok) throw new Error((data && data.error) || `Coach server error (${res.status})`);
+    coachMsgs.push({ role: 'ai', text: data.reply, suggestions: data.suggestions || [] });
+  } catch (e) {
+    coachMsgs.push({ role: 'ai', error: true, text: e.name === 'AbortError' ? 'The coach took too long — try again.' : e instanceof TypeError ? `Couldn’t reach the server (${e.message}). Check your connection, then use Test connection in Settings.` : e.message });
+  }
+  coachBusy = false; coachSave();
+  if (coachEl) renderCoachBody(true);
+}
+
+function fmtChat(text) {
+  return esc(text).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/^- /gm, '• ');
+}
+
+function suggestionRows(m, mi) {
+  const rows = (m.suggestions || []).map((s, si) => ({ s, si, f: foodById(s.food_id) })).filter((x) => x.f);
+  if (!rows.length) return '';
+  const unlogged = rows.filter((x) => !(m.logged && m.logged[x.si]));
+  const tot = totalsOf(rows.map((x) => ({ per: x.f, qty: x.s.qty })));
+  return `<div class="sugg-list">${rows.map(({ s, si, f }) => {
+    const done = m.logged && m.logged[si], tt = totalsOf([{ per: f, qty: s.qty }]);
+    return `<div class="sugg"><div class="sugg-main"><div class="name">${esc(f.name)}</div>
+      <div class="sub">${esc(amountLabel({ serving: f.serving, g: f.g, qty: s.qty }))}${s.note ? ` · ${esc(s.note)}` : ''}</div>
+      <div class="mini"><b>${fmtK(tt.k)} kcal</b> · <b class="p-c">P ${fmt(tt.p)}</b> · <b class="c-c">C ${fmt(tt.c)}</b> · <b class="f-c">F ${fmt(tt.f)}</b></div></div>
+      ${done ? '<span class="logged-ok">✓ Logged</span>' : `<button class="btn primary sm" data-act="coach-log" data-m="${mi}" data-s="${si}">Log</button>`}</div>`;
+  }).join('')}
+    ${unlogged.length > 1 ? `<div class="sugg-all"><span class="small muted">Together: <b>${fmtK(tot.k)} kcal</b> · P ${fmt(tot.p)} · C ${fmt(tot.c)} · F ${fmt(tot.f)}</span><button class="btn sm" data-act="coach-log-all" data-m="${mi}">Log all</button></div>` : ''}</div>`;
+}
+
+function renderCoachHead() {
+  const left = $('#coach-left', coachEl); if (!left) return;
+  const t = dayTotals(coachDate), T = S.targets, rem = (m) => fmt(T[m] - t[m]);
+  left.innerHTML = `<span class="small muted">${coachDate === todayStr() ? 'Left today' : 'Left on ' + dayName(coachDate, { month: 'short', day: 'numeric' })}</span>
+    <span class="nums"><b>${fmtK(T.k - t.k)} kcal</b><b class="p-c">P ${rem('p')}</b><b class="c-c">C ${rem('c')}</b><b class="f-c">F ${rem('f')}</b></span>`;
+}
+
+function renderCoachBody(scroll) {
+  const body = $('#chat-body', coachEl); if (!body) return;
+  let html = '';
+  if (!coachMsgs.length) {
+    html += `<div class="msg ai">Hey! I can see what you’ve logged and what’s left against your targets. Ask me what to eat next, or tap a question below.</div>`;
+  }
+  coachMsgs.forEach((m, i) => {
+    html += `<div class="msg ${m.role === 'user' ? 'user' : 'ai'}${m.error ? ' err' : ''}">${fmtChat(m.text)}</div>`;
+    if (m.role === 'ai' && !m.error) html += suggestionRows(m, i);
+  });
+  if (coachBusy) html += `<div class="msg ai typing"><i></i><i></i><i></i></div>`;
+  body.innerHTML = html;
+  const chips = $('#chat-chips', coachEl);
+  if (chips) chips.innerHTML = COACH_PROMPTS.map((q) => `<button class="pill" data-act="coach-ask" data-q="${esc(q)}" ${coachBusy ? 'disabled' : ''}>${esc(q)}</button>`).join('');
+  if (scroll) body.scrollTop = body.scrollHeight;
+}
+
+function openCoach() {
+  if (!scanReady()) { scanSetupSheet(); return; }
+  coachDate = viewDate; coachLoad(coachDate); coachBusy = false;
+  coachEl = openLayer(`
+    <div class="add-head"><div style="flex:1;padding-left:2px"><b style="font-size:18px">Coach</b><div class="small muted">${relLabel(coachDate)} · ${dayName(coachDate, { month: 'short', day: 'numeric' })}</div></div>
+      <button class="ghost" data-act="coach-clear">Clear</button><button class="ghost" data-act="close-layer">Done</button></div>
+    <div class="coach-left" id="coach-left"></div>
+    <div class="chat-body" id="chat-body"></div>
+    <div class="hscroll" id="chat-chips" style="padding-top:8px"></div>
+    <div class="chat-input"><textarea id="chat-text" rows="1" maxlength="1000" placeholder="Ask what to eat…" autocomplete="off"></textarea>
+      <button class="send" data-act="coach-send" aria-label="Send">${SEND_SVG}</button></div>`, { full: true });
+  const ta = $('#chat-text', coachEl);
+  ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 120) + 'px'; });
+  ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); actions['coach-send'](); } });
+  renderCoachHead(); renderCoachBody(true);
+}
+
+function coachLogItems(mi, indexes) {
+  const m = coachMsgs[mi]; if (!m) return;
+  const items = indexes.map((si) => ({ si, s: m.suggestions[si], f: foodById(m.suggestions[si] && m.suggestions[si].food_id) })).filter((x) => x.f && !(m.logged && m.logged[x.si]));
+  if (!items.length) return;
+  m.logged = m.logged || {};
+  change(items.length === 1 ? `Added ${items[0].f.name}` : `Added ${items.length} foods`, () => {
+    const list = (S.log[coachDate] = S.log[coachDate] || []);
+    let ts = Date.now();
+    for (const { s, f, si } of items) { list.push(makeEntry(f, s.qty, ts++)); S.usual[f.id] = s.qty; m.logged[si] = true; }
+  });
+  coachSave(); if (coachEl) renderCoachBody(false);
 }
 
 /* ---------- confirm / menus ---------- */
@@ -621,7 +762,7 @@ function viewSettings() {
     <div class="grid2" style="margin-top:8px"><div class="field" style="margin:0"><input id="sp-name" placeholder="Name" autocomplete="off"></div><div class="field" style="margin:0"><input id="sp-dose" placeholder="Dose (optional)" autocomplete="off"></div></div>
     <button class="btn block" style="margin-top:10px" data-act="add-supp">Add supplement</button></div>
   <div class="card"><h2>Saved meals</h2>${S.meals.length ? S.meals.map((m) => `<button class="row" style="padding-left:0;padding-right:0" data-act="meal" data-id="${m.id}"><div class="row-main"><div class="name">${esc(m.name)}</div><div class="sub">${m.items.length} items · ${fmtK(mealTotals(m).k)} kcal</div></div><span class="muted">›</span></button>`).join('') : '<div class="muted small">Log a few foods, then use ⋯ → “Save entries as a meal” on the Today screen.</div>'}</div>
-  <div class="card"><h2>Label scanner</h2><div class="small muted" style="margin-bottom:10px">Photograph a Nutrition Facts label and Claude fills in the food. Needs your own proxy — see the README. The token stays on this phone and is not included in backups.</div>
+  <div class="card"><h2>AI proxy (scanner &amp; coach)</h2><div class="small muted" style="margin-bottom:10px">Powers the label scanner and the coach chat. Needs your own proxy — see the README. The token stays on this phone and is not included in backups.</div>
     <div class="field"><label>Proxy address</label><input id="scan-url" data-scan="url" inputmode="url" autocomplete="off" placeholder="https://lean-bulk-log-scan.your-name.workers.dev" value="${esc(scanCfg().url || '')}"></div>
     <div class="field"><label>App token</label><input id="scan-token" data-scan="token" type="password" autocomplete="off" value="${esc(scanCfg().token || '')}"></div>
     <div class="btn-row" style="margin-top:0"><button class="btn" data-act="scan-test">Test connection</button></div>
@@ -776,6 +917,12 @@ const actions = {
   'import-json': () => $('#import-file').click(),
   'merge-json': () => $('#merge-file').click(),
   'undo-import': () => askConfirm('Undo the last import and go back to exactly what the app held before it?', 'Undo', () => undoImport()),
+  'open-coach': () => openCoach(),
+  'coach-send': () => { const ta = $('#chat-text', coachEl); if (!ta) return; const v = ta.value; ta.value = ''; ta.style.height = 'auto'; coachSend(v); },
+  'coach-ask': (el) => coachSend(el.dataset.q),
+  'coach-log': (el) => coachLogItems(+el.dataset.m, [+el.dataset.s]),
+  'coach-log-all': (el) => { const m = coachMsgs[+el.dataset.m]; if (m) coachLogItems(+el.dataset.m, m.suggestions.map((_, i) => i)); },
+  'coach-clear': () => askConfirm('Clear this conversation?', 'Clear', () => { coachMsgs = []; coachSave(); if (coachEl) renderCoachBody(true); }),
   'scan-label': () => { if (scanReady()) scanPick(false); else scanSetupSheet(); },
   'scan-retry': () => { closeLayer(); setTimeout(() => scanPick(false), 280); },
   'scan-gallery': () => { closeLayer(); setTimeout(() => scanPick(true), 280); },
