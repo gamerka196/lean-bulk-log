@@ -711,8 +711,8 @@ function coachLogItems(mi, indexes) {
 
 /* ---------- TRAIN: routine, set logging, rest timer, progress ---------- */
 const EX = (id, name, sets, variants) => ({ id, name, sets, variants: variants || [] });
-const ROUTINE_VERSION = 3; // v3: no abs; v2: arms live only on the Arms day
-const OLD_ROUTINE_HASHES = [1551759032, -964817554]; // fingerprints of the untouched v1/v2 routines: only an unedited routine gets upgraded
+const ROUTINE_VERSION = 4; // v4: bar dips replace close-grip bench; v3: no abs; v2: arms live only on the Arms day
+const OLD_ROUTINE_HASHES = [1551759032, -964817554, 1172889878]; // fingerprints of the untouched v1/v2/v3 routines: only an unedited routine gets upgraded
 const DEFAULT_REPS = [12, 10, 8, 8]; // rep target per set until you set your own (Train -> Routine)
 const repsFor = (ex, i) => { const a = ex.reps && ex.reps.length ? ex.reps : DEFAULT_REPS; return a[i] !== undefined ? a[i] : a[a.length - 1]; };
 const repsList = (ex) => Array.from({ length: ex.sets }, (_, i) => repsFor(ex, i));
@@ -748,7 +748,7 @@ const DEFAULT_ROUTINE = {
       EX('shrugs', 'Shrugs', 4),
     ] },
     { id: 'sat', dow: 6, name: 'Arms', exercises: [
-      EX('close-grip', 'Close-grip bench / Biceps curl', 4, ['Close-grip bench', 'Biceps curl']),
+      EX('dips', 'Bar dips / Biceps curl', 4, ['Bar dips', 'Biceps curl']),
       EX('oh-triceps', 'Overhead triceps / Pushdowns', 4, ['Overhead triceps press', 'Triceps pushdown']),
       EX('curl', 'DB curls / Barbell curls', 4, ['DB curls', 'Barbell curls']),
       EX('hammer', 'Hammer curls', 4),
