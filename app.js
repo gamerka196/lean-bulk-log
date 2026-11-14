@@ -581,7 +581,7 @@ async function testScanner(btn) {
 const COACH_KEY = 'lbl.coach'; // conversation lives outside the main state/backups; one conversation per day
 let coachEl = null, coachBusy = false, coachDate = null;
 let coachMsgs = []; // { role: 'user'|'ai', text, suggestions?: [{food_id, qty, note}], logged?: {idx: true}, error?: true }
-const COACH_PROMPTS = ['What should I eat next?', 'How’s my day looking?', 'Easiest way to hit my protein', 'Late-night snack ideas', 'Something quick and cheap'];
+const COACH_PROMPTS = ['What should I eat next?', 'How should I progress my weights?', 'Am I stalling on any lifts?', 'How’s my day looking?', 'Easiest way to hit my protein', 'Late-night snack ideas', 'Something quick and cheap'];
 
 function coachLoad(date) {
   try { const o = JSON.parse(localStorage.getItem(COACH_KEY)); coachMsgs = o && o.date === date && Array.isArray(o.msgs) ? o.msgs : []; } catch (e) { coachMsgs = []; }
@@ -603,6 +603,7 @@ function coachContext(date) {
     supplementsTaken: (S.suppLog[date] || []).map((id) => (S.supps.find((s) => s.id === id) || {}).name).filter(Boolean),
     last7DaysAverage: days.length ? { days_logged: days.length, kcal: Math.round(avg('k')), protein_g: r(avg('p')) } : null,
     training: workoutContext(date),
+    exercises: exerciseHistoryContext(),
     favouriteFoodIds: favourites(14),
     foods: S.foods.map((f) => ({ id: f.id, name: f.name, serving: f.serving, category: f.cat, kcal: f.k, protein_g: f.p, carbs_g: f.c, fat_g: f.f, usual_servings: usualQty(f.id) })),
   };
@@ -628,7 +629,7 @@ async function coachSend(text) {
     } finally { clearTimeout(timer); }
     const data = await res.json().catch(() => null);
     if (!data || !data.ok) throw new Error((data && data.error) || `Coach server error (${res.status})`);
-    coachMsgs.push({ role: 'ai', text: data.reply, suggestions: data.suggestions || [] });
+    coachMsgs.push({ role: 'ai', text: data.reply, suggestions: data.suggestions || [], plan: data.plan || [] });
   } catch (e) {
     coachMsgs.push({ role: 'ai', error: true, text: e.name === 'AbortError' ? 'The coach took too long — try again.' : e instanceof TypeError ? `Couldn’t reach the server (${e.message}). Check your connection, then use Test connection in Settings.` : e.message });
   }
@@ -655,6 +656,33 @@ function suggestionRows(m, mi) {
     ${unlogged.length > 1 ? `<div class="sugg-all"><span class="small muted">Together: <b>${fmtK(tot.k)} kcal</b> · P ${fmt(tot.p)} · C ${fmt(tot.c)} · F ${fmt(tot.f)}</span><button class="btn sm" data-act="coach-log-all" data-m="${mi}">Log all</button></div>` : ''}</div>`;
 }
 
+/* weights the coach suggests for your next session of an exercise, with a one-tap "Use it" */
+function planRows(m, mi) {
+  const rows = (m.plan || []).map((p, pi) => ({ p, pi, ex: findExercise(p.exercise_id) })).filter((x) => x.ex);
+  if (!rows.length) return '';
+  return `<div class="sugg-list">${rows.map(({ p, pi, ex }) => {
+    const done = m.applied && m.applied[pi];
+    return `<div class="sugg"><div class="sugg-main"><div class="name">${esc(ex.name)}</div>${p.note ? `<div class="sub">${esc(p.note)}</div>` : ''}
+      <div class="mini"><b>Next time: ${p.weights.map((x) => fmt(x)).join(' · ')} lb</b></div></div>
+      ${done ? '<span class="logged-ok">✓ Saved</span>' : `<button class="btn primary sm" data-act="coach-plan" data-m="${mi}" data-p="${pi}">Use it</button>`}</div>`;
+  }).join('')}</div>`;
+}
+function applyPlan(mi, pi) {
+  const m = coachMsgs[mi], p = m && m.plan && m.plan[pi]; if (!p || !findExercise(p.exercise_id)) return;
+  W().nextWeights[p.exercise_id] = p.weights.map(String);
+  const s = sessionOn(todayStr()); // a workout already open today? update its unfinished sets right away
+  const e = s && s.exercises.find((x) => x.exId === p.exercise_id);
+  if (e && !e.sets.every((x) => x.done)) {
+    e.sets.forEach((x, i) => { if (!x.done) x.w = String(p.weights[i] !== undefined ? p.weights[i] : p.weights[p.weights.length - 1]); });
+    delByExercise(p.exercise_id);
+    if (workoutEl) renderWorkout();
+  }
+  m.applied = m.applied || {}; m.applied[pi] = true;
+  save(); coachSave(); if (coachEl) renderCoachBody(false);
+  toast(e ? 'Updated today’s workout' : 'Saved — it will be pre-filled next time you train it');
+}
+function delByExercise(id) { delete W().nextWeights[id]; }
+
 function renderCoachHead() {
   const left = $('#coach-left', coachEl); if (!left) return;
   const t = dayTotals(coachDate), T = S.targets, rem = (m) => fmt(T[m] - t[m]);
@@ -666,11 +694,11 @@ function renderCoachBody(scroll) {
   const body = $('#chat-body', coachEl); if (!body) return;
   let html = '';
   if (!coachMsgs.length) {
-    html += `<div class="msg ai">Hey! I can see what you’ve logged and what’s left against your targets. Ask me what to eat next, or tap a question below.</div>`;
+    html += `<div class="msg ai">Hey! I can see your food log, your targets, and your lift history. Ask me what to eat next, or how to progress your weights, or tap a question below.</div>`;
   }
   coachMsgs.forEach((m, i) => {
     html += `<div class="msg ${m.role === 'user' ? 'user' : 'ai'}${m.error ? ' err' : ''}">${fmtChat(m.text)}</div>`;
-    if (m.role === 'ai' && !m.error) html += suggestionRows(m, i);
+    if (m.role === 'ai' && !m.error) html += suggestionRows(m, i) + planRows(m, i);
   });
   if (coachBusy) html += `<div class="msg ai typing"><i></i><i></i><i></i></div>`;
   body.innerHTML = html;
@@ -767,7 +795,7 @@ function ensureWorkouts() {
     if (OLD_ROUTINE_HASHES.includes(h)) w.routine = JSON.parse(JSON.stringify(DEFAULT_ROUTINE));
     else w.routine.v = ROUTINE_VERSION;
   }
-  w.sessions = w.sessions || {}; w.baseline = w.baseline || {}; w.prefs = w.prefs || { rest: 90 };
+  w.sessions = w.sessions || {}; w.baseline = w.baseline || {}; w.prefs = w.prefs || { rest: 90 }; w.nextWeights = w.nextWeights || {};
   return w;
 }
 const W = () => ensureWorkouts();
@@ -833,7 +861,9 @@ function prefillSets(ex, v, date, n) {
   for (let i = 0; i < n; i++) {
     const l = last ? (last[i] || last[last.length - 1]) : null;
     const b = base && base.length ? (base[i] !== undefined ? base[i] : base[base.length - 1]) : null;
-    const w = l ? l.w : b !== null && b !== undefined ? b : pw;
+    const nwList = W().nextWeights[ex.id]; // weights the coach suggested and you accepted win over everything else
+    const nw = nwList && nwList.length ? (nwList[i] !== undefined ? nwList[i] : nwList[nwList.length - 1]) : null;
+    const w = nw !== null ? nw : l ? l.w : b !== null && b !== undefined ? b : pw;
     const r = l ? l.r : repsFor(ex, i); // last session's reps, else the exercise's rep scheme (12/10/8/8 by default)
     out.push({ w, r, done: false });
     pw = w; pr = r;
@@ -842,7 +872,9 @@ function prefillSets(ex, v, date, n) {
 }
 function buildExercise(ex, date) {
   const v = ex.variants.length ? nextVariant(ex, date) : '';
-  return { exId: ex.id, name: ex.name, variant: v, sets: prefillSets(ex, v, date, ex.sets) };
+  const sets = prefillSets(ex, v, date, ex.sets);
+  delete W().nextWeights[ex.id]; // accepted coach weights are used once, then normal history takes over
+  return { exId: ex.id, name: ex.name, variant: v, sets };
 }
 
 let workoutEl = null, workoutDate = null, workoutTick = null, wakeLock = null;
@@ -992,6 +1024,7 @@ function viewTrain() {
       <button class="btn primary block" data-act="w-start" data-day="${planned.id}">Start ${esc(planned.name)}</button>
       <div class="small muted" style="margin-top:8px">Workouts follow a rotation, not the calendar. Skip a day and the next one simply waits for you.</div></div>`;
   }
+  html += `<button class="card coach-card" data-act="open-coach"><span class="coach-ic">${CHAT_SVG}</span><span style="flex:1;min-width:0"><b>Ask your coach about your lifts</b><span class="small muted" style="display:block">Weight progression, plateaus, what to add next</span></span><span class="muted">›</span></button>`;
   const lastBy = lastDoneByDay();
   html += `<div class="list"><div class="list-h"><h2>Rotation</h2></div>${w.routine.days.map((d, i) => {
     const isNext = planned && d.id === planned.id && !sess;
@@ -1088,6 +1121,30 @@ function exportWorkoutsCsv() {
   }
   download(`lean-bulk-log-workouts-${todayStr()}.csv`, '﻿' + rows.map((r) => r.map(q).join(',')).join('\r\n'), 'text/csv');
   toast(rows.length > 1 ? 'Workouts CSV exported' : 'No finished sets to export yet');
+}
+
+/* what the coach needs to talk about progression: per exercise, the last few sessions' sets, best 1RM estimate, rep scheme */
+function exerciseHistoryContext() {
+  const w = W(), seen = new Set(), out = [];
+  const dates = Object.keys(w.sessions).sort().reverse();
+  for (const d of w.routine.days) for (const ex of d.exercises) {
+    if (seen.has(ex.id)) continue;
+    seen.add(ex.id);
+    const recent = [];
+    let best = 0;
+    for (const date of dates) {
+      const e = w.sessions[date].exercises.find((x) => x.exId === ex.id && x.sets.some((s) => s.done));
+      if (!e) continue;
+      for (const s of e.sets) if (s.done) best = Math.max(best, e1rm(numOf(s.w), numOf(s.r)));
+      if (recent.length < 6) recent.push({ date, variant: e.variant || undefined, sets: e.sets.filter((s) => s.done).map((s) => `${numOf(s.w)}x${numOf(s.r)}`).join(' ') });
+    }
+    out.push({
+      id: ex.id, name: ex.name, variants: ex.variants.length ? ex.variants : undefined, day: d.name, planned_reps_per_set: repsList(ex),
+      sessions_logged: recent.length, recent_sessions: recent, best_estimated_1rm_lb: Math.round(best) || undefined,
+      starting_weights_lb: !recent.length && w.baseline[ex.id] ? w.baseline[ex.id] : undefined,
+    });
+  }
+  return out;
 }
 
 function workoutContext(date) {
@@ -1355,6 +1412,7 @@ const actions = {
   'coach-ask': (el) => coachSend(el.dataset.q),
   'coach-log': (el) => coachLogItems(+el.dataset.m, [+el.dataset.s]),
   'coach-log-all': (el) => { const m = coachMsgs[+el.dataset.m]; if (m) coachLogItems(+el.dataset.m, m.suggestions.map((_, i) => i)); },
+  'coach-plan': (el) => applyPlan(+el.dataset.m, +el.dataset.p),
   'coach-clear': () => askConfirm('Clear this conversation?', 'Clear', () => { coachMsgs = []; coachSave(); if (coachEl) renderCoachBody(true); }),
   'scan-label': () => { if (scanReady()) scanPick(false); else scanSetupSheet(); },
   'scan-retry': () => { closeLayer(); setTimeout(() => scanPick(false), 280); },
