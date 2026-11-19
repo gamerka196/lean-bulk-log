@@ -590,6 +590,20 @@ let coachEl = null, coachBusy = false, coachDate = null;
 let coachMsgs = []; // { role: 'user'|'ai', text, suggestions?: [{food_id, qty, note}], logged?: {idx: true}, error?: true }
 const COACH_PROMPTS = ['What should I eat next?', 'How should I progress my weights?', 'Am I stalling on any lifts?', 'How’s my day looking?', 'Easiest way to hit my protein', 'Late-night snack ideas', 'Something quick and cheap'];
 
+/* the coach's voice: a preset plus anything you add. Voice only — the worker keeps every rule, number and safety limit fixed. */
+const COACH_PRESETS = {
+  default: { label: 'Straight-talking', text: 'A straight-talking training partner: concise, practical, a little humour, no lectures.' },
+  hype: { label: 'Hype gym-bro', text: 'High-energy, loud, confident gym humour. Hype the user up, tease them when they skip things, celebrate PRs. Swearing is fine and should sound casual, never forced. Open with a short punchy line, then explain the why in a few real sentences.' },
+  dry: { label: 'Dry humour', text: 'Deadpan and a bit sarcastic, understated. Roast gently but never meanly. Concise, with the occasional dry one-liner, and the reasoning explained clearly.' },
+  mentor: { label: 'Calm mentor', text: 'Calm, patient and encouraging. Plain language, no jargon dumps, reassuring but honest about what needs work.' },
+  sergeant: { label: 'Tough love', text: 'Tough-love drill sergeant. Blunt and demanding, no excuses, but fair, and always finish with one clear next action.' },
+  nerd: { label: 'Science nerd', text: 'Evidence-first and nerdy: briefly explain the mechanism (progressive overload, stimulus versus fatigue, protein per meal) and say so when the evidence is mixed.' },
+};
+function coachStyleBody() {
+  const cs = S.coachStyle || {}, p = COACH_PRESETS[cs.preset] || COACH_PRESETS.default;
+  return { persona: [p.text, String(cs.custom || '').trim()].filter(Boolean).join(' ').slice(0, 900), principles: String(cs.principles || '').trim().slice(0, 2000) };
+}
+
 function coachLoad(date) {
   try { const o = JSON.parse(localStorage.getItem(COACH_KEY)); coachMsgs = o && o.date === date && Array.isArray(o.msgs) ? o.msgs : []; } catch (e) { coachMsgs = []; }
 }
@@ -632,7 +646,7 @@ async function coachSend(text) {
     const timer = setTimeout(() => ctrl.abort(), 90000);
     let res;
     try {
-      res = await fetch(chatUrl(), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': cfg.token }, body: JSON.stringify({ messages, context: coachContext(coachDate) }), signal: ctrl.signal });
+      res = await fetch(chatUrl(), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': cfg.token }, body: JSON.stringify({ messages, context: coachContext(coachDate), ...coachStyleBody() }), signal: ctrl.signal });
     } finally { clearTimeout(timer); }
     const data = await res.json().catch(() => null);
     if (!data || !data.ok) throw new Error((data && data.error) || `Coach server error (${res.status})`);
@@ -803,6 +817,7 @@ function ensureWorkouts() {
     else w.routine.v = ROUTINE_VERSION;
   }
   w.sessions = w.sessions || {}; w.baseline = w.baseline || {}; w.prefs = w.prefs || { rest: 90 }; w.nextWeights = w.nextWeights || {};
+  if (!S.coachStyle || typeof S.coachStyle !== 'object') S.coachStyle = { preset: 'default', custom: '', principles: '' };
   return w;
 }
 const W = () => ensureWorkouts();
@@ -1345,6 +1360,11 @@ function viewSettings() {
     <div class="field"><label>App token</label><input id="scan-token" data-scan="token" type="password" autocomplete="off" value="${esc(scanCfg().token || '')}"></div>
     <div class="btn-row" style="margin-top:0"><button class="btn" data-act="scan-test">Test connection</button></div>
     <div class="small muted" id="scan-test-result" style="margin-top:8px"></div></div>
+  <div class="card"><h2>Coach personality</h2><div class="small muted" style="margin-bottom:10px">Sets how your coach talks. The advice itself always comes from your real food log, targets and lift history.</div>
+    <div class="chips" style="margin-bottom:12px">${Object.entries(COACH_PRESETS).map(([k, p]) => `<button class="pill ${(S.coachStyle.preset || 'default') === k ? 'on' : ''}" data-act="coach-preset" data-p="${k}">${esc(p.label)}</button>`).join('')}</div>
+    <div class="field"><label>Your own style notes (optional) — e.g. a YouTuber’s vibe, swearing, answer length</label><textarea data-cs="custom" rows="3" maxlength="500" placeholder="e.g. Style inspiration: … high-energy, funny, swears casually, punchy first line then a few sentences of why.">${esc(S.coachStyle.custom || '')}</textarea></div>
+    <div class="field" style="margin-bottom:0"><label>Your coaching principles (optional) — your own notes, in your words</label><textarea data-cs="principles" rows="5" maxlength="2000" placeholder="e.g. Add weight only when I hit the top reps on every set. Keep 1–2 reps in reserve. Don't junk volume.">${esc(S.coachStyle.principles || '')}</textarea></div>
+    <div class="small muted" style="margin-top:8px">Saved as you type. The coach follows your principles when they fit your data and stay safe.</div></div>
   <div class="card"><h2>Food database</h2><div class="small muted" style="margin-bottom:10px">Looks for wrong calories, impossible serving weights, duplicates and uncategorised foods — including the ones you scanned or added here.</div><button class="btn block" data-act="open-check">Check my database</button></div>
   <div class="card"><h2>Backup &amp; export</h2><div class="small muted" style="margin-bottom:10px">Last backup: <b>${last}</b>. Clearing browser data erases everything here, so export now and then and keep the file in Drive/Photos.</div>
     <div class="btn-row" style="margin-top:0"><button class="btn primary" data-act="export-json">Backup (JSON)</button><button class="btn" data-act="import-json">Restore…</button></div>
@@ -1534,6 +1554,7 @@ const actions = {
   'coach-ask': (el) => coachSend(el.dataset.q),
   'coach-log': (el) => coachLogItems(+el.dataset.m, [+el.dataset.s]),
   'coach-log-all': (el) => { const m = coachMsgs[+el.dataset.m]; if (m) coachLogItems(+el.dataset.m, m.suggestions.map((_, i) => i)); },
+  'coach-preset': (el) => { S.coachStyle.preset = el.dataset.p; save(); render(); toast(`Coach voice: ${COACH_PRESETS[el.dataset.p].label}`); },
   'open-check': () => openCheck(),
   'chk-fix': (el) => runCheckFix(+el.dataset.i, el.dataset.fix, el.dataset.id),
   'coach-plan': (el) => applyPlan(+el.dataset.m, +el.dataset.p),
@@ -1558,6 +1579,7 @@ document.addEventListener('input', (e) => {
     const col = t.closest('.scol'), card = t.closest('.xcard'), s = sessionOn(workoutDate);
     if (s) { s.exercises[+card.dataset.ei].sets[+col.dataset.si][t.dataset.f] = t.value.replace(',', '.'); saveSoon(); }
   }
+  if (t.dataset && t.dataset.cs) { S.coachStyle[t.dataset.cs] = t.value; saveSoon(); }
   if (t.id === 'w-cardio' && workoutEl) { const s = sessionOn(workoutDate); if (s) { s.cardioMin = parseInt(t.value, 10) || 0; saveSoon(); } }
 });
 // Enter jumps to the same box in the next set (type a whole weights line, like your sheet)
