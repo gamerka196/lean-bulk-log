@@ -599,6 +599,14 @@ const COACH_PRESETS = {
   sergeant: { label: 'Tough love', text: 'Tough-love drill sergeant. Blunt and demanding, no excuses, but fair, and always finish with one clear next action.' },
   nerd: { label: 'Science nerd', text: 'Evidence-first and nerdy: briefly explain the mechanism (progressive overload, stimulus versus fatigue, protein per meal) and say so when the evidence is mixed.' },
 };
+/* a starter set of widely used hypertrophy principles: edit freely, they are yours once inserted */
+const STARTER_PRINCIPLES = [
+  '- Progress by total reps: when the total reps across all my sets reach the top of my target, add the smallest weight jump next session (for 4 sets that is roughly 20 to 24 total reps).',
+  '- Stay 1 to 3 reps short of failure on most sets: the early sets nearer 2 to 3 reps in reserve, the last set closest to failure. Avoid grinding to failure.',
+  '- Judge volume per week, not per session: roughly 10 to 20 hard sets per muscle per week. If performance or recovery drops, trim sets before adding exercises.',
+  '- If a lift stalls for 3 or more sessions, check sleep, food and recovery and adjust sets or reps before simply adding weight.',
+  '- Cut junk volume: extra sets that only add fatigue and no extra stimulus.',
+].join('\n');
 function coachStyleBody() {
   const cs = S.coachStyle || {}, p = COACH_PRESETS[cs.preset] || COACH_PRESETS.default;
   return { persona: [p.text, String(cs.custom || '').trim()].filter(Boolean).join(' ').slice(0, 900), principles: String(cs.principles || '').trim().slice(0, 2000) };
@@ -1364,7 +1372,8 @@ function viewSettings() {
     <div class="chips" style="margin-bottom:12px">${Object.entries(COACH_PRESETS).map(([k, p]) => `<button class="pill ${(S.coachStyle.preset || 'default') === k ? 'on' : ''}" data-act="coach-preset" data-p="${k}">${esc(p.label)}</button>`).join('')}</div>
     <div class="field"><label>Your own style notes (optional) — e.g. a YouTuber’s vibe, swearing, answer length</label><textarea data-cs="custom" rows="3" maxlength="500" placeholder="e.g. Style inspiration: … high-energy, funny, swears casually, punchy first line then a few sentences of why.">${esc(S.coachStyle.custom || '')}</textarea></div>
     <div class="field" style="margin-bottom:0"><label>Your coaching principles (optional) — your own notes, in your words</label><textarea data-cs="principles" rows="5" maxlength="2000" placeholder="e.g. Add weight only when I hit the top reps on every set. Keep 1–2 reps in reserve. Don't junk volume.">${esc(S.coachStyle.principles || '')}</textarea></div>
-    <div class="small muted" style="margin-top:8px">Saved as you type. The coach follows your principles when they fit your data and stay safe.</div></div>
+    <button class="btn sm" style="margin-top:8px" data-act="starter-principles">Insert starter principles</button>
+    <div class="small muted" style="margin-top:8px">Saved as you type. Your principles take priority over the coach’s default progression rules, but never over safety or your real data.</div></div>
   <div class="card"><h2>Food database</h2><div class="small muted" style="margin-bottom:10px">Looks for wrong calories, impossible serving weights, duplicates and uncategorised foods — including the ones you scanned or added here.</div><button class="btn block" data-act="open-check">Check my database</button></div>
   <div class="card"><h2>Backup &amp; export</h2><div class="small muted" style="margin-bottom:10px">Last backup: <b>${last}</b>. Clearing browser data erases everything here, so export now and then and keep the file in Drive/Photos.</div>
     <div class="btn-row" style="margin-top:0"><button class="btn primary" data-act="export-json">Backup (JSON)</button><button class="btn" data-act="import-json">Restore…</button></div>
@@ -1554,6 +1563,10 @@ const actions = {
   'coach-ask': (el) => coachSend(el.dataset.q),
   'coach-log': (el) => coachLogItems(+el.dataset.m, [+el.dataset.s]),
   'coach-log-all': (el) => { const m = coachMsgs[+el.dataset.m]; if (m) coachLogItems(+el.dataset.m, m.suggestions.map((_, i) => i)); },
+  'starter-principles': () => {
+    const put = () => { S.coachStyle.principles = STARTER_PRINCIPLES; save(); render(); toast('Starter principles added — edit them to match what you believe'); };
+    if ((S.coachStyle.principles || '').trim()) askConfirm('Replace what you wrote in “Your coaching principles” with the starter set?', 'Replace', put); else put();
+  },
   'coach-preset': (el) => { S.coachStyle.preset = el.dataset.p; save(); render(); toast(`Coach voice: ${COACH_PRESETS[el.dataset.p].label}`); },
   'open-check': () => openCheck(),
   'chk-fix': (el) => runCheckFix(+el.dataset.i, el.dataset.fix, el.dataset.id),
