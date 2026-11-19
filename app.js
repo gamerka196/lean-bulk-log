@@ -654,7 +654,7 @@ async function coachSend(text) {
     const timer = setTimeout(() => ctrl.abort(), 90000);
     let res;
     try {
-      res = await fetch(chatUrl(), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': cfg.token }, body: JSON.stringify({ messages, context: coachContext(coachDate), ...coachStyleBody() }), signal: ctrl.signal });
+      res = await fetch(chatUrl(), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': cfg.token }, body: JSON.stringify({ messages, context: coachContext(coachDate), ...coachStyleBody(), knowledge: kbSelect(messages) }), signal: ctrl.signal });
     } finally { clearTimeout(timer); }
     const data = await res.json().catch(() => null);
     if (!data || !data.ok) throw new Error((data && data.error) || `Coach server error (${res.status})`);
@@ -826,6 +826,7 @@ function ensureWorkouts() {
   }
   w.sessions = w.sessions || {}; w.baseline = w.baseline || {}; w.prefs = w.prefs || { rest: 90 }; w.nextWeights = w.nextWeights || {};
   if (!S.coachStyle || typeof S.coachStyle !== 'object') S.coachStyle = { preset: 'default', custom: '', principles: '' };
+  if (!Array.isArray(S.knowledge)) S.knowledge = [];
   return w;
 }
 const W = () => ensureWorkouts();
@@ -1301,6 +1302,78 @@ function runCheckFix(i, fix, id) {
   if (fix === 'honey-tbsp') return askPast(f, { serving: '1 tbsp (21 g)', g: 21, k: 64, p: 0, c: 17.3, f: 0, s: 17.2 }, 'Honey is now 1 tbsp (64 kcal)');
 }
 
+/* ---------- KNOWLEDGE BASE: your own reference documents for the coach ---------- */
+const KB_MAX = 200000;  // characters you can keep on the phone
+const KB_SEND = 24000;  // characters sent with one question; bigger libraries send only the sections that match the question
+const KB_STOP = new Set('the and for are but not you your with that this have from they will what when how why can should could would about into than then them there their been were was has had does did get got just like need want make more most some any all out one two too very also over under after before while which who its'.split(' '));
+const kbTokens = (s) => String(s).toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3 && !KB_STOP.has(w));
+const kbDocs = () => (S.knowledge || []).filter((d) => d.on !== false && String(d.text || '').trim());
+const kbTotal = () => (S.knowledge || []).reduce((n, d) => n + String(d.text || '').length, 0);
+
+function kbChunks(docs) {
+  const out = [];
+  docs.forEach((d, di) => {
+    let cur = '';
+    const flush = () => { if (cur.trim()) out.push({ di, text: cur.trim() }); cur = ''; };
+    for (const para of String(d.text).split(/\n{2,}/)) {
+      if (cur && cur.length + para.length > 1100) flush();
+      cur += (cur ? '\n\n' : '') + para;
+      while (cur.length > 1600) { out.push({ di, text: cur.slice(0, 1400) }); cur = cur.slice(1400); }
+    }
+    flush();
+  });
+  return out.map((c, i) => ({ ...c, i }));
+}
+/* what to send with this question: everything if it fits, otherwise the sections that best match what was just asked */
+function kbSelect(messages) {
+  const docs = kbDocs(); if (!docs.length) return [];
+  if (docs.reduce((n, d) => n + d.text.length, 0) <= KB_SEND) return docs.map((d) => ({ title: d.title, text: d.text }));
+  const qs = new Set(kbTokens(messages.filter((m) => m.role === 'user').slice(-2).map((m) => m.content).join(' ')));
+  const chunks = kbChunks(docs).map((c) => { const seen = new Set(); let hits = 0; for (const w of kbTokens(c.text)) if (qs.has(w)) { hits++; seen.add(w); } return { ...c, score: seen.size * 3 + Math.min(hits, 12) }; });
+  const picked = []; let used = 0;
+  const take = (c) => { if (used + c.text.length > KB_SEND) return; picked.push(c); used += c.text.length; };
+  if (chunks.some((c) => c.score > 0)) chunks.filter((c) => c.score > 0).sort((a, b) => b.score - a.score || a.i - b.i).forEach(take);
+  else docs.forEach((_, di) => { const first = chunks.find((c) => c.di === di); if (first) take(first); }); // nothing matched: send each document's opening
+  const byDoc = new Map();
+  for (const c of picked.sort((a, b) => a.i - b.i)) { if (!byDoc.has(c.di)) byDoc.set(c.di, []); byDoc.get(c.di).push(c.text); }
+  return [...byDoc.entries()].map(([di, texts]) => ({ title: docs[di].title, text: texts.join('\n\n…\n\n') }));
+}
+
+function kbCardHtml() {
+  const docs = S.knowledge || [];
+  return `<div class="card"><h2>Coach knowledge base</h2><div class="small muted" style="margin-bottom:10px">Your own reference notes. The coach reads the relevant parts when you ask and names the document it used. They stay on this phone and go to Claude through your proxy only when you ask the coach. Add notes you wrote or summaries in your own words, not copied transcripts or book text.</div>
+    ${docs.length ? docs.map((d) => `<div class="row" style="padding-left:0;padding-right:0"><button class="row-main" data-act="kb-edit" data-id="${d.id}" style="text-align:left"><div class="name">${esc(d.title)}</div><div class="sub">${fmtK(String(d.text).length)} characters${d.on === false ? ' · off' : ''}</div></button><button class="pill ${d.on === false ? '' : 'on'}" data-act="kb-toggle" data-id="${d.id}">${d.on === false ? 'Off' : 'On'}</button></div>`).join('') : '<div class="muted small" style="margin-bottom:6px">No documents yet.</div>'}
+    <div class="small muted" style="margin:8px 0">${fmtK(kbTotal())} of ${fmtK(KB_MAX)} characters used · up to ${fmtK(KB_SEND)} sent per question</div>
+    <button class="btn block" data-act="kb-add">Add a document</button></div>`;
+}
+
+function kbSheet(id) {
+  const d = id ? S.knowledge.find((x) => x.id === id) : null;
+  const el = openLayer(`<div class="sheet-title">${d ? 'Edit document' : 'Add a document'}</div>
+    <div class="field" style="margin-top:10px"><label>Title</label><input id="kb-title" maxlength="80" placeholder="e.g. My training principles" value="${esc(d ? d.title : '')}"></div>
+    <div class="field"><label>Text — paste it here, or load a .txt / .md file</label><textarea id="kb-text" rows="10" placeholder="Paste your notes…">${esc(d ? d.text : '')}</textarea></div>
+    <div class="small muted" id="kb-count" style="margin-bottom:8px"></div>
+    <div class="btn-row" style="flex-wrap:wrap"><button class="btn" id="kb-file">Load a file…</button>${d ? '<button class="btn danger" id="kb-del">Delete</button>' : ''}<button class="btn primary" id="kb-save">Save</button></div>
+    <input type="file" id="kb-file-in" accept=".txt,.md,.markdown,text/plain,text/markdown" hidden>`);
+  const ta = $('#kb-text', el), count = () => { $('#kb-count', el).textContent = `${fmtK(ta.value.length)} characters`; };
+  ta.addEventListener('input', count); count();
+  $('#kb-file', el).onclick = () => $('#kb-file-in', el).click();
+  $('#kb-file-in', el).onchange = async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    if (f.size > KB_MAX) { toast('That file is too big for the knowledge base'); return; }
+    ta.value = (await f.text()).replace(/\r\n/g, '\n'); count();
+    if (!$('#kb-title', el).value.trim()) $('#kb-title', el).value = f.name.replace(/\.[^.]+$/, '').slice(0, 80);
+  };
+  $('#kb-save', el).onclick = () => {
+    const title = $('#kb-title', el).value.trim() || 'Untitled', text = ta.value.replace(/\r\n/g, '\n').trim();
+    if (!text) { toast('Add some text first'); return; }
+    if (kbTotal() - (d ? String(d.text).length : 0) + text.length > KB_MAX) { toast(`Too long — the knowledge base holds ${fmtK(KB_MAX)} characters in total`); return; }
+    if (d) { d.title = title; d.text = text; } else S.knowledge.push({ id: 'k' + uid(), title, text, on: true, ts: Date.now() });
+    save(); closeLayer(); render(); toast('Document saved');
+  };
+  if (d) $('#kb-del', el).onclick = () => { closeLayer(); setTimeout(() => askConfirm(`Delete “${d.title}” from the knowledge base?`, 'Delete', () => { S.knowledge = S.knowledge.filter((x) => x.id !== d.id); save(); render(); toast('Document deleted'); }), 280); };
+}
+
 /* ---------- confirm / menus ---------- */
 function askConfirm(msg, okLabel, fn) {
   const el = openLayer(`<div class="sheet-title">${esc(msg)}</div><div class="btn-row"><button class="btn" data-act="close-layer">Cancel</button><button class="btn primary" id="c-ok">${esc(okLabel)}</button></div>`);
@@ -1374,6 +1447,7 @@ function viewSettings() {
     <div class="field" style="margin-bottom:0"><label>Your coaching principles (optional) — your own notes, in your words</label><textarea data-cs="principles" rows="5" maxlength="2000" placeholder="e.g. Add weight only when I hit the top reps on every set. Keep 1–2 reps in reserve. Don't junk volume.">${esc(S.coachStyle.principles || '')}</textarea></div>
     <button class="btn sm" style="margin-top:8px" data-act="starter-principles">Insert starter principles</button>
     <div class="small muted" style="margin-top:8px">Saved as you type. Your principles take priority over the coach’s default progression rules, but never over safety or your real data.</div></div>
+  ${kbCardHtml()}
   <div class="card"><h2>Food database</h2><div class="small muted" style="margin-bottom:10px">Looks for wrong calories, impossible serving weights, duplicates and uncategorised foods — including the ones you scanned or added here.</div><button class="btn block" data-act="open-check">Check my database</button></div>
   <div class="card"><h2>Backup &amp; export</h2><div class="small muted" style="margin-bottom:10px">Last backup: <b>${last}</b>. Clearing browser data erases everything here, so export now and then and keep the file in Drive/Photos.</div>
     <div class="btn-row" style="margin-top:0"><button class="btn primary" data-act="export-json">Backup (JSON)</button><button class="btn" data-act="import-json">Restore…</button></div>
@@ -1473,10 +1547,12 @@ function mergeBackup(o) {
     for (const [d, s] of Object.entries(o.workouts.sessions || {})) if (s && Array.isArray(s.exercises) && !w.sessions[d]) { w.sessions[d] = s; addedSessions++; }
     for (const [k, v] of Object.entries(o.workouts.baseline || {})) if (Array.isArray(v) && v.length && !w.baseline[k]) { w.baseline[k] = v; addedBase++; }
   }
+  let addedDocs = 0; // knowledge-base documents, matched by title so importing twice never duplicates them
+  for (const d of o.knowledge || []) if (d && d.title && typeof d.text === 'string' && d.text.trim() && !S.knowledge.some((x) => x.title === d.title) && kbTotal() + d.text.length <= KB_MAX) { S.knowledge.push({ id: 'k' + uid(), title: String(d.title).slice(0, 80), text: d.text, on: d.on !== false, ts: Date.now() }); addedDocs++; }
   save(); refresh();
-  const anything = addedEntries || addedFoods || addedSessions || addedBase;
-  toast(anything ? `Merged ${addedEntries} food entries (${addedDays} new days), ${addedFoods} new foods${addedSessions || addedBase ? `, ${addedSessions} workouts, ${addedBase} starting weights` : ''}` : 'Nothing new to merge — it’s already in the app', anything ? () => { S = JSON.parse(snap); ensureWorkouts(); save(); refresh(); } : null);
-  return { addedEntries, addedDays, addedFoods, addedMeals, addedSessions, addedBase };
+  const anything = addedEntries || addedFoods || addedSessions || addedBase || addedDocs;
+  toast(anything ? `Merged ${addedEntries} food entries (${addedDays} new days), ${addedFoods} new foods${addedSessions || addedBase ? `, ${addedSessions} workouts, ${addedBase} starting weights` : ''}${addedDocs ? `, ${addedDocs} documents` : ''}` : 'Nothing new to merge — it’s already in the app', anything ? () => { S = JSON.parse(snap); ensureWorkouts(); save(); refresh(); } : null);
+  return { addedEntries, addedDays, addedFoods, addedMeals, addedSessions, addedBase, addedDocs };
 }
 
 function importJson(file, merge = false) {
@@ -1563,6 +1639,9 @@ const actions = {
   'coach-ask': (el) => coachSend(el.dataset.q),
   'coach-log': (el) => coachLogItems(+el.dataset.m, [+el.dataset.s]),
   'coach-log-all': (el) => { const m = coachMsgs[+el.dataset.m]; if (m) coachLogItems(+el.dataset.m, m.suggestions.map((_, i) => i)); },
+  'kb-add': () => kbSheet(null),
+  'kb-edit': (el) => kbSheet(el.dataset.id),
+  'kb-toggle': (el) => { const d = S.knowledge.find((x) => x.id === el.dataset.id); if (d) { d.on = d.on === false; save(); render(); } },
   'starter-principles': () => {
     const put = () => { S.coachStyle.principles = STARTER_PRINCIPLES; save(); render(); toast('Starter principles added — edit them to match what you believe'); };
     if ((S.coachStyle.principles || '').trim()) askConfirm('Replace what you wrote in “Your coaching principles” with the starter set?', 'Replace', put); else put();
