@@ -209,6 +209,8 @@ b { font-weight: 650; }
 .rx-btns { display: flex; gap: 6px; margin-top: 8px; } .rx-btns button { padding: 6px 10px; border-radius: 9px; background: var(--card); border: 1px solid var(--line); font-size: 13px; }
 .rx-btns button[disabled] { opacity: .3; pointer-events: none; }
 button.row-main { background: none; border: 0; color: inherit; padding: 0; font: inherit; cursor: pointer; }
+.issue { background: var(--card2); border: 1px solid var(--line); border-radius: 14px; padding: 11px 12px; margin: 6px 0; }
+.issue .name { font-weight: 650; }
 /* coach */
 .coach-card { display: flex; align-items: center; gap: 12px; width: calc(100% - 28px); text-align: left; }
 .coach-card:active { background: var(--card2); }

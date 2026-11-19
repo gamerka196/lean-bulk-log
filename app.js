@@ -136,6 +136,7 @@ function openLayer(html, { full = false } = {}) {
 function removeTopLayer() {
   const el = layers.pop();
   if (!el) return;
+  if (el === checkEl) checkEl = null;
   if (el.classList.contains('full')) {
     document.body.classList.remove('has-add');
     if (el === addEl) addEl = null;
@@ -319,9 +320,11 @@ function viewHistory() {
 /* ---------- FOODS ---------- */
 let foodQ = '';
 function viewFoods() {
+  const issues = findIssues().length;
   return `<div class="top"><div><h1>Foods</h1><div class="sub">${S.foods.length} in your database</div></div>
     <div style="display:flex;gap:8px"><button class="btn" data-act="scan-label" aria-label="Scan a nutrition label" style="padding:10px 12px;color:var(--accent)">${CAMERA_SVG}</button><button class="btn primary" data-act="new-food">+ New</button></div></div>
     <div style="padding:10px 14px 0"><div class="search"><input id="food-q" type="search" placeholder="Search foods…" value="${esc(foodQ)}" autocomplete="off"></div></div>
+    <button class="card coach-card" data-act="open-check" style="margin-top:10px"><span class="coach-ic" style="font-size:20px">${issues ? '!' : '✓'}</span><span style="flex:1;min-width:0"><b>Check my database</b><span class="small muted" style="display:block">${issues ? `${issues} thing${issues === 1 ? '' : 's'} to review — wrong calories, duplicates` : 'Nothing to review right now'}</span></span><span class="muted">›</span></button>
     <div class="list" id="food-list"></div>`;
 }
 function foodRow(f, act = 'edit-food') {
@@ -353,6 +356,7 @@ function openFoodForm(food, { fromAdd = false, prefill = null, banner = '', phot
     <div class="field"><label>Sugar (g)</label><input id="ff-s" inputmode="decimal" value="${f.s}"></div></div>
     <div class="field"><label>Category</label><select id="ff-cat">${cats.map((c) => `<option ${c === f.cat ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></div>
     ${isNew ? '' : `<label class="check"><input type="checkbox" id="ff-pin" ${S.pins.includes(f.id) ? 'checked' : ''}> Always show in favourites</label>`}
+    ${!isNew && pastCount(f.id) ? `<label class="check"><input type="checkbox" id="ff-hist"> Also update the ${pastCount(f.id)} past log entries with these numbers</label>` : ''}
     <div class="btn-row">${isNew ? '' : '<button class="btn danger" id="ff-del">Delete</button>'}<button class="btn primary" id="ff-save">Save</button></div>`);
   const v = (id) => $(id, el).value.trim();
   const n = (id) => { const x = parseFloat(v(id)); return Number.isFinite(x) && x >= 0 ? x : 0; };
@@ -369,8 +373,11 @@ function openFoodForm(food, { fromAdd = false, prefill = null, banner = '', phot
     let target = food;
     if (isNew) { target = { id: 'f' + uid(), ...rec }; S.foods.push(target); } else { delete target.g; Object.assign(target, rec); }
     if (!isNew) { const pin = $('#ff-pin', el).checked; S.pins = S.pins.filter((x) => x !== target.id); if (pin) S.pins.push(target.id); }
-    save(); closeLayer(); refresh(); if (addEl) renderAddBody();
+    let updatedPast = 0;
+    if (!isNew && $('#ff-hist', el) && $('#ff-hist', el).checked) { snapshotBefore('food edit'); updatedPast = applyPast(target); }
+    save(); closeLayer(); refresh(); if (addEl) renderAddBody(); if (checkEl) paintCheck();
     if (isNew && fromAdd) setTimeout(() => openQty({ food: target }), 260);
+    else if (updatedPast) toast(`Changes saved · ${updatedPast} past entries updated`, () => undoImport());
     else toast(isNew ? 'Food saved' : 'Changes saved');
   };
   if (!isNew) $('#ff-del', el).onclick = () => askConfirm(`Delete “${food.name}” from your database? Past logs are not affected.`, 'Delete', () => {
@@ -1157,6 +1164,120 @@ function workoutContext(date) {
   };
 }
 
+/* ---------- DATABASE CHECK: find likely mistakes in your foods and fix them in one tap ---------- */
+let checkEl = null, checkIssues = [];
+const baseName = (n) => String(n).toLowerCase().replace(/\(.*?\)/g, ' ').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+const parenOf = (n) => ((String(n).match(/\((.*?)\)/) || [])[1] || '').toLowerCase().trim();
+const pastCount = (id) => Object.values(S.log).reduce((n, es) => n + es.filter((e) => e.foodId === id).length, 0);
+const macroSnap = (f) => ({ k: f.k, p: f.p, c: f.c, f: f.f, s: f.s });
+
+/* push a food's current numbers into every logged entry that used it */
+function applyPast(food) {
+  let n = 0;
+  for (const es of Object.values(S.log)) for (const e of es) if (e.foodId === food.id) { e.per = macroSnap(food); e.serving = food.serving; e.g = food.g || null; n++; }
+  return n;
+}
+
+function findIssues() {
+  S.checkIgnored = S.checkIgnored || [];
+  const ign = new Set(S.checkIgnored), out = [], covered = new Set();
+  const add = (key, o) => { if (!ign.has(key)) out.push({ key, ...o }); };
+  const ok = (v) => Math.round(v * 10) / 10;
+
+  for (const f of S.foods) { // known problem from the original spreadsheet: honey stored with tablespoon numbers
+    if (f.name.trim().toLowerCase() === 'honey' && /tsp|teaspoon/i.test(f.serving) && f.k >= 55) {
+      covered.add(f.id);
+      add(`honey:${f.id}`, { kind: 'Known problem', foods: [f.id], title: `${f.name} has tablespoon numbers`,
+        detail: `“${f.serving}” is stored as ${f.k} kcal and ${ok(f.c)} g carbs. Those are the numbers for a tablespoon (21 g). A real teaspoon is about 21 kcal and 5.8 g carbs, so every teaspoon you log is overcounted by roughly ${Math.round(f.k - 21)} kcal.`,
+        actions: [{ label: 'Make it a real teaspoon', fix: 'honey-tsp', primary: true }, { label: 'I measure tablespoons', fix: 'honey-tbsp' }] });
+    }
+  }
+
+  const buckets = {};
+  for (const f of S.foods) { const key = `${baseName(f.name)}|${String(f.serving).toLowerCase().replace(/\s+/g, '')}`; (buckets[key] = buckets[key] || []).push(f); }
+  for (const list of Object.values(buckets)) {
+    if (list.length < 2) continue;
+    if (new Set(list.map((f) => parenOf(f.name)).filter(Boolean)).size >= 2) continue; // e.g. Grilled vs Steamed are genuinely different foods
+    add(`dupe:${list.map((f) => f.id).sort().join(',')}`, { kind: 'Possible duplicate', foods: list.map((f) => f.id), title: `${list.length} entries look like the same food`,
+      detail: list.map((f) => `${f.name}: ${f.k} kcal · P ${ok(f.p)} · C ${ok(f.c)} · F ${ok(f.f)} · logged ${pastCount(f.id)}×`).join('\n'),
+      actions: list.map((f) => ({ label: `Keep “${f.name}”`, fix: 'keep', id: f.id })).concat([{ label: 'They’re different', fix: 'ignore' }]) });
+  }
+
+  for (const f of S.foods) {
+    if (covered.has(f.id)) continue;
+    const calc = 4 * f.p + 4 * f.c + 9 * f.f, tol = Math.max(35, 0.2 * f.k);
+    if (f.k > 0 && f.p + f.c + f.f === 0) add(`nomac:${f.id}`, { kind: 'Missing numbers', foods: [f.id], title: `${f.name} has calories but no macros`, detail: `${f.k} kcal, but protein, carbs and fat are all 0.`, actions: [{ label: 'Edit', fix: 'edit', primary: true }, { label: 'Looks fine', fix: 'ignore' }] });
+    else if (f.k === 0 && f.p + f.c + f.f > 1) add(`nokcal:${f.id}`, { kind: 'Missing numbers', foods: [f.id], title: `${f.name} has macros but 0 calories`, detail: `Its macros add up to about ${Math.round(calc)} kcal.`, actions: [{ label: `Set calories to ${Math.round(calc)}`, fix: 'kcal', primary: true }, { label: 'Edit', fix: 'edit' }, { label: 'Looks fine', fix: 'ignore' }] });
+    else if (Math.abs(f.k - calc) > tol) add(`kcal:${f.id}`, { kind: 'Calories don’t match macros', foods: [f.id], title: f.name,
+      detail: `${f.serving}: listed ${f.k} kcal, but ${ok(f.p)} g protein + ${ok(f.c)} g carbs + ${ok(f.f)} g fat adds up to about ${Math.round(calc)} kcal. Fibre or sugar alcohols can explain a gap — if the label says so, tap “Looks fine”.`,
+      actions: [{ label: `Set calories to ${Math.round(calc)}`, fix: 'kcal', primary: true }, { label: 'Edit', fix: 'edit' }, { label: 'Looks fine', fix: 'ignore' }] });
+    if (f.s > f.c + 0.5) add(`sugar:${f.id}`, { kind: 'Sugar above carbs', foods: [f.id], title: f.name, detail: `Sugar (${ok(f.s)} g) can’t be more than total carbs (${ok(f.c)} g).`, actions: [{ label: `Set sugar to ${ok(f.c)} g`, fix: 'sugar', primary: true }, { label: 'Edit', fix: 'edit' }, { label: 'Looks fine', fix: 'ignore' }] });
+    if (f.g && f.p + f.c + f.f > f.g * 1.02) add(`mass:${f.id}`, { kind: 'Serving weight looks wrong', foods: [f.id], title: f.name, detail: `${f.serving} weighs ${f.g} g, but the protein, carbs and fat add up to ${ok(f.p + f.c + f.f)} g — more than the whole serving. Either the weight or the macros are off.`, actions: [{ label: 'Edit', fix: 'edit', primary: true }, { label: 'Looks fine', fix: 'ignore' }] });
+    else if (f.g && (f.k / f.g > 9.3 || (f.k > 30 && f.k / f.g < 0.08))) add(`dens:${f.id}`, { kind: 'Serving weight looks wrong', foods: [f.id], title: f.name, detail: `${f.k} kcal in ${f.g} g is ${ok(f.k / f.g)} kcal per gram, which isn’t realistic for food.`, actions: [{ label: 'Edit', fix: 'edit', primary: true }, { label: 'Looks fine', fix: 'ignore' }] });
+    if (f.cat === 'Other') add(`cat:${f.id}`, { kind: 'No category', foods: [f.id], title: f.name, detail: 'Filed under “Other”, so it’s harder to find when you browse by category.', actions: [{ label: 'Edit', fix: 'edit', primary: true }, { label: 'Fine as is', fix: 'ignore' }] });
+  }
+  const order = ['Known problem', 'Possible duplicate', 'Missing numbers', 'Calories don’t match macros', 'Sugar above carbs', 'Serving weight looks wrong', 'No category'];
+  return out.sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
+}
+
+function paintCheck() {
+  const box = checkEl && $('#chk-body', checkEl); if (!box) return;
+  checkIssues = findIssues();
+  if (!checkIssues.length) { box.innerHTML = `<div class="empty">✓ Nothing to review.<br><span class="small">Checked ${S.foods.length} foods: calories vs macros, serving weights, duplicates, categories.</span></div>`; return; }
+  let html = `<div class="muted small" style="margin-bottom:8px">${checkIssues.length} thing${checkIssues.length === 1 ? '' : 's'} to review across ${S.foods.length} foods. Nothing changes until you tap a fix.</div>`, last = '';
+  checkIssues.forEach((it, i) => {
+    if (it.kind !== last) { html += `<div class="sect" style="padding:12px 2px 4px">${esc(it.kind)}</div>`; last = it.kind; }
+    html += `<div class="issue"><div class="name">${esc(it.title)}</div><div class="small muted" style="white-space:pre-line;margin:3px 0 8px">${esc(it.detail)}</div>
+      <div class="xfoot" style="margin-top:0">${it.actions.map((a) => `<button class="btn sm ${a.primary ? 'primary' : ''}" data-act="chk-fix" data-i="${i}" data-fix="${a.fix}" data-id="${esc(a.id || '')}">${esc(a.label)}</button>`).join('')}</div></div>`;
+  });
+  box.innerHTML = html;
+}
+
+function openCheck() {
+  checkEl = openLayer(`<div class="sheet-title">Check my database</div><div id="chk-body" style="margin-top:6px"></div>`);
+  paintCheck();
+}
+
+function applyFoodPatch(f, patch, alsoPast, msg) {
+  snapshotBefore('database fix');
+  Object.assign(f, patch);
+  const n = alsoPast ? applyPast(f) : 0;
+  save(); refresh(); if (checkEl) paintCheck(); if (addEl) renderAddBody();
+  toast(`${msg}${n ? ` · ${n} past entries recalculated` : ''}`, () => undoImport());
+}
+function askPast(f, patch, msg) {
+  const n = pastCount(f.id);
+  if (!n) { applyFoodPatch(f, patch, false, msg); return; }
+  const el = openLayer(`<div class="sheet-title">Also fix your past entries?</div>
+    <div class="muted" style="margin:6px 0 12px">You’ve logged “${esc(f.name)}” ${n} time${n === 1 ? '' : 's'} with the old numbers. Recalculating changes those days’ totals; leaving them keeps your history exactly as it was logged.</div>
+    <div class="btn-row" style="flex-wrap:wrap"><button class="btn" id="ap-no">Fix food only</button><button class="btn primary" id="ap-yes">Fix food + ${n} past</button></div>`);
+  $('#ap-no', el).onclick = () => { closeLayer(); setTimeout(() => applyFoodPatch(f, patch, false, msg), 280); };
+  $('#ap-yes', el).onclick = () => { closeLayer(); setTimeout(() => applyFoodPatch(f, patch, true, msg), 280); };
+}
+
+function runCheckFix(i, fix, id) {
+  const it = checkIssues[i]; if (!it) return;
+  const f = foodById(it.foods[0]);
+  if (fix === 'ignore') { S.checkIgnored.push(it.key); save(); paintCheck(); refresh(); return; }
+  if (fix === 'edit') { if (f) openFoodForm(f); return; }
+  if (fix === 'keep') {
+    const keep = foodById(id), drop = it.foods.filter((x) => x !== id).map(foodById).filter(Boolean); if (!keep) return;
+    snapshotBefore('duplicate cleanup');
+    const dropIds = new Set(drop.map((d) => d.id));
+    for (const es of Object.values(S.log)) for (const e of es) if (dropIds.has(e.foodId)) e.foodId = keep.id; // history now counts toward the one you kept
+    for (const m of S.meals) for (const x of m.items) if (dropIds.has(x.foodId)) x.foodId = keep.id;
+    S.foods = S.foods.filter((x) => !dropIds.has(x.id));
+    S.pins = [...new Set(S.pins.map((p) => (dropIds.has(p) ? keep.id : p)))];
+    save(); refresh(); paintCheck(); if (addEl) renderAddBody();
+    toast(`Kept “${keep.name}” and removed ${drop.length} duplicate`, () => undoImport()); return;
+  }
+  if (!f) return;
+  if (fix === 'kcal') return askPast(f, { k: Math.round(4 * f.p + 4 * f.c + 9 * f.f) }, `${f.name}: calories set to ${Math.round(4 * f.p + 4 * f.c + 9 * f.f)}`);
+  if (fix === 'sugar') return askPast(f, { s: f.c }, `${f.name}: sugar set to ${f.c} g`);
+  if (fix === 'honey-tsp') return askPast(f, { serving: '1 tsp (7g)', g: 7, k: 21, p: 0, c: 5.8, f: 0, s: 5.8 }, 'Honey is now a real teaspoon (21 kcal)');
+  if (fix === 'honey-tbsp') return askPast(f, { serving: '1 tbsp (21 g)', g: 21, k: 64, p: 0, c: 17.3, f: 0, s: 17.2 }, 'Honey is now 1 tbsp (64 kcal)');
+}
+
 /* ---------- confirm / menus ---------- */
 function askConfirm(msg, okLabel, fn) {
   const el = openLayer(`<div class="sheet-title">${esc(msg)}</div><div class="btn-row"><button class="btn" data-act="close-layer">Cancel</button><button class="btn primary" id="c-ok">${esc(okLabel)}</button></div>`);
@@ -1224,6 +1345,7 @@ function viewSettings() {
     <div class="field"><label>App token</label><input id="scan-token" data-scan="token" type="password" autocomplete="off" value="${esc(scanCfg().token || '')}"></div>
     <div class="btn-row" style="margin-top:0"><button class="btn" data-act="scan-test">Test connection</button></div>
     <div class="small muted" id="scan-test-result" style="margin-top:8px"></div></div>
+  <div class="card"><h2>Food database</h2><div class="small muted" style="margin-bottom:10px">Looks for wrong calories, impossible serving weights, duplicates and uncategorised foods — including the ones you scanned or added here.</div><button class="btn block" data-act="open-check">Check my database</button></div>
   <div class="card"><h2>Backup &amp; export</h2><div class="small muted" style="margin-bottom:10px">Last backup: <b>${last}</b>. Clearing browser data erases everything here, so export now and then and keep the file in Drive/Photos.</div>
     <div class="btn-row" style="margin-top:0"><button class="btn primary" data-act="export-json">Backup (JSON)</button><button class="btn" data-act="import-json">Restore…</button></div>
     <button class="btn block" style="margin-top:8px" data-act="merge-json">Import history (keep my data)…</button>
@@ -1277,7 +1399,7 @@ function undoImport() {
   if (!p || !p.data || !Array.isArray(p.data.foods)) { toast('Nothing to undo'); return; }
   S = p.data; ensureWorkouts();
   try { localStorage.removeItem(PREV_KEY); } catch (e) { /* ignore */ }
-  save(); viewDate = todayStr(); refresh(); toast(`Undid the ${p.label} — your data is back`);
+  save(); viewDate = todayStr(); refresh(); if (checkEl) paintCheck(); toast(`Undid the ${p.label} — your data is back`);
 }
 
 /* Merge a backup INTO the current data: nothing existing is removed or changed. Safe to run twice. */
@@ -1412,6 +1534,8 @@ const actions = {
   'coach-ask': (el) => coachSend(el.dataset.q),
   'coach-log': (el) => coachLogItems(+el.dataset.m, [+el.dataset.s]),
   'coach-log-all': (el) => { const m = coachMsgs[+el.dataset.m]; if (m) coachLogItems(+el.dataset.m, m.suggestions.map((_, i) => i)); },
+  'open-check': () => openCheck(),
+  'chk-fix': (el) => runCheckFix(+el.dataset.i, el.dataset.fix, el.dataset.id),
   'coach-plan': (el) => applyPlan(+el.dataset.m, +el.dataset.p),
   'coach-clear': () => askConfirm('Clear this conversation?', 'Clear', () => { coachMsgs = []; coachSave(); if (coachEl) renderCoachBody(true); }),
   'scan-label': () => { if (scanReady()) scanPick(false); else scanSetupSheet(); },
