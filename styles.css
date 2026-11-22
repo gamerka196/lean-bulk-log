@@ -246,3 +246,12 @@ button.row-main { background: none; border: 0; color: inherit; padding: 0; font:
 #toast.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
 #toast button { color: #3ddc84; font-weight: 700; }
 body.has-add #toast { bottom: calc(80px + env(safe-area-inset-bottom)); }
+
+/* where a coach answer came from */
+.src-row { align-self: flex-start; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; max-width: 94%; margin: -1px 0 8px 2px; font-size: 12px; }
+.src-badge { padding: 3px 9px; border-radius: 999px; font-weight: 650; background: var(--card2); border: 1px solid var(--line); color: var(--muted); }
+.src-badge.library { background: color-mix(in srgb, var(--accent) 18%, var(--card)); border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); color: var(--accent); }
+.src-badge.partly { border-color: color-mix(in srgb, var(--p) 50%, var(--line)); color: var(--p); }
+.src-badge.general { border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); color: var(--warn); }
+.src-link { padding: 3px 9px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); color: var(--text); text-decoration: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+a.src-link:active { background: var(--card2); }

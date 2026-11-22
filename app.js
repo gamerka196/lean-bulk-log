@@ -650,15 +650,21 @@ async function coachSend(text) {
   const messages = coachMsgs.filter((m) => !m.error).slice(-12).map((m) => ({ role: m.role === 'ai' ? 'assistant' : 'user', content: m.text.slice(0, 1900) }));
   while (messages.length && messages[0].role !== 'user') messages.shift();
   try {
+    // video library: search it here on the phone and send only the matching passages. If the search fails, say so
+    // rather than quietly answering without it, since the point is that the advice comes from those videos.
+    let library = null;
+    if (libOn()) {
+      try { library = await libSelect(messages); } catch (e) { throw new Error(`Couldn’t search your video library: ${e.message}`); }
+    }
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 90000);
     let res;
     try {
-      res = await fetch(chatUrl(), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': cfg.token }, body: JSON.stringify({ messages, context: coachContext(coachDate), ...coachStyleBody(), knowledge: kbSelect(messages) }), signal: ctrl.signal });
+      res = await fetch(chatUrl(), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': cfg.token }, body: JSON.stringify({ messages, context: coachContext(coachDate), ...coachStyleBody(), knowledge: kbSelect(messages), ...(library ? { library, ground: libStrict() ? 'strict' : 'prefer' } : {}) }), signal: ctrl.signal });
     } finally { clearTimeout(timer); }
     const data = await res.json().catch(() => null);
     if (!data || !data.ok) throw new Error((data && data.error) || `Coach server error (${res.status})`);
-    coachMsgs.push({ role: 'ai', text: data.reply, suggestions: data.suggestions || [], plan: data.plan || [] });
+    coachMsgs.push({ role: 'ai', text: data.reply, suggestions: data.suggestions || [], plan: data.plan || [], sources: data.sources || [], grounding: data.grounding || null });
   } catch (e) {
     coachMsgs.push({ role: 'ai', error: true, text: e.name === 'AbortError' ? 'The coach took too long — try again.' : e instanceof TypeError ? `Couldn’t reach the server (${e.message}). Check your connection, then use Test connection in Settings.` : e.message });
   }
@@ -723,11 +729,11 @@ function renderCoachBody(scroll) {
   const body = $('#chat-body', coachEl); if (!body) return;
   let html = '';
   if (!coachMsgs.length) {
-    html += `<div class="msg ai">Hey! I can see your food log, your targets, and your lift history. Ask me what to eat next, or how to progress your weights, or tap a question below.</div>`;
+    html += `<div class="msg ai">Hey! I can see your food log, your targets, and your lift history${libOn() ? ', and I’ll search your video library for training advice and tell you which videos it came from' : ''}. Ask me what to eat next, or how to progress your weights, or tap a question below.</div>`;
   }
   coachMsgs.forEach((m, i) => {
     html += `<div class="msg ${m.role === 'user' ? 'user' : 'ai'}${m.error ? ' err' : ''}">${fmtChat(m.text)}</div>`;
-    if (m.role === 'ai' && !m.error) html += suggestionRows(m, i) + planRows(m, i);
+    if (m.role === 'ai' && !m.error) html += sourceRow(m) + suggestionRows(m, i) + planRows(m, i);
   });
   if (coachBusy) html += `<div class="msg ai typing"><i></i><i></i><i></i></div>`;
   body.innerHTML = html;
@@ -1374,6 +1380,202 @@ function kbSheet(id) {
   if (d) $('#kb-del', el).onclick = () => { closeLayer(); setTimeout(() => askConfirm(`Delete “${d.title}” from the knowledge base?`, 'Delete', () => { S.knowledge = S.knowledge.filter((x) => x.id !== d.id); save(); render(); toast('Document deleted'); }), 280); };
 }
 
+/* ---------- VIDEO LIBRARY: a big transcript collection, searched on the phone ---------- */
+// Too big for localStorage, so it lives in IndexedDB. For every coach question the phone ranks all passages
+// (BM25 keyword search) and sends only the best matches, so the coach answers from them and can show which videos it used.
+const LIB_META_KEY = 'lbl.libmeta'; // small summary kept in localStorage so Settings can show it instantly
+const LIB_SEND = 30000;             // characters of passages sent with one question
+const LIB_MAX_PER_DOC = 4;          // so one video can't crowd out the rest
+const LIB_MAX_CHARS = 30000000;
+let libIndex = null, libLoading = null;
+const libMeta = () => { try { return JSON.parse(localStorage.getItem(LIB_META_KEY)) || {}; } catch (e) { return {}; } };
+const libReady = () => !!libMeta().videos;
+const libOn = () => libReady() && (S.coachStyle || {}).useLib !== false;
+const libStrict = () => (S.coachStyle || {}).ground !== 'prefer';
+const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+
+const LIB_STOP = new Set([...KB_STOP, ...'yeah okay really going gonna know think actually because thing things these those where still even much many only don doesn isn didn won let say said want lot kind sort'.split(' ')]);
+function libStem(w) {
+  if (w.length > 3) {
+    if (w.length > 4 && w.endsWith('ies')) w = w.slice(0, -3) + 'y';
+    else if (w.endsWith('sses')) w = w.slice(0, -2);
+    else if (w.endsWith('s') && !w.endsWith('ss') && !w.endsWith('us')) w = w.slice(0, -1);
+  }
+  if (w.length > 5 && w.endsWith('ing')) w = w.slice(0, -3); else if (w.length > 5 && w.endsWith('ed')) w = w.slice(0, -2);
+  if (/([^aeioulsz])\1$/.test(w)) w = w.slice(0, -1);
+  if (w.length > 4 && w.endsWith('e')) w = w.slice(0, -1);
+  return w;
+}
+const libTokens = (s) => String(s).toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3 && !LIB_STOP.has(w)).map(libStem);
+/* gym words people use for the same idea, so "stalling" also finds "plateau" and "overload" */
+const LIB_SYN_RAW = {
+  progress: ['progression', 'progressive', 'overload'], progression: ['progress', 'overload'], plateau: ['stall', 'stuck'], stall: ['plateau', 'stuck'], stuck: ['plateau', 'stall'],
+  failure: ['reserve', 'grind'], fail: ['failure'], volume: ['sets', 'frequency'], sets: ['volume'], bulk: ['surplus', 'gain', 'bulking'], bulking: ['surplus', 'gain'], cut: ['deficit', 'cutting', 'fat'],
+  shoulder: ['delt', 'lateral'], delts: ['shoulder', 'lateral'], bicep: ['curl'], tricep: ['pushdown', 'extension', 'dips'], chest: ['pec', 'bench'], lats: ['pulldown', 'pullup', 'row'], back: ['lats', 'row'],
+  legs: ['squat', 'quad', 'hamstring'], deload: ['recovery', 'fatigue'], recover: ['recovery', 'sleep', 'fatigue'], tired: ['fatigue', 'recovery'], weights: ['load', 'heavy'], weight: ['load', 'heavy'],
+  frequency: ['week', 'twice'], eat: ['calorie', 'protein', 'food'], diet: ['calorie', 'protein', 'food'], warmup: ['warm'], technique: ['form'], form: ['technique'],
+};
+let libSyn = null;
+const libSynonyms = () => libSyn || (libSyn = Object.fromEntries(Object.entries(LIB_SYN_RAW).map(([k, v]) => [libStem(k), v.map(libStem)])));
+
+async function libBuild(docs) {
+  const meta = [], chunks = [], inv = new Map(); let total = 0;
+  for (let di = 0; di < docs.length; di++) {
+    const d = docs[di];
+    meta.push({ id: d.id, title: d.title, vid: d.vid || '' });
+    const tt = libTokens(d.title);
+    d.c.forEach(([t, text], ci) => {
+      const idx = chunks.length, tf = new Map(), toks = libTokens(text);
+      for (const w of toks) tf.set(w, (tf.get(w) || 0) + 1);
+      for (const w of tt) tf.set(w, (tf.get(w) || 0) + 2); // a hit in the video's title is a strong hint
+      chunks.push({ d: di, ci, t, text, len: toks.length || 1 });
+      total += toks.length || 1;
+      for (const [w, n] of tf) { let p = inv.get(w); if (!p) inv.set(w, p = []); p.push(idx, n); }
+    });
+    if (di % 12 === 11) await new Promise((r) => setTimeout(r)); // let the screen breathe while indexing
+  }
+  return { meta, chunks, inv, avg: total / Math.max(1, chunks.length) };
+}
+
+function libDb() {
+  return new Promise((res, rej) => {
+    if (!window.indexedDB) { rej(new Error('This browser has no IndexedDB storage')); return; }
+    const r = indexedDB.open('lbl-lib', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('docs', { keyPath: 'id' });
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error || new Error('Could not open the library storage'));
+  });
+}
+const idbDone = (tx) => new Promise((res, rej) => { tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error || new Error('Storage was interrupted — is the phone out of space?')); });
+async function libReadAll() {
+  const db = await libDb();
+  try { return await new Promise((res, rej) => { const q = db.transaction('docs').objectStore('docs').getAll(); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); } finally { db.close(); }
+}
+async function libGet() {
+  if (libIndex) return libIndex;
+  if (!libLoading) {
+    libLoading = libReadAll().then(async (docs) => {
+      if (!docs.length) { localStorage.removeItem(LIB_META_KEY); throw new Error('Your video library is empty on this phone — load the file again in Settings → Video library.'); }
+      return (libIndex = await libBuild(docs));
+    }).finally(() => { libLoading = null; });
+  }
+  return libLoading;
+}
+async function libRefreshMeta() {
+  const docs = await libReadAll();
+  if (!docs.length) { localStorage.removeItem(LIB_META_KEY); return; }
+  localStorage.setItem(LIB_META_KEY, JSON.stringify({ videos: docs.length, passages: docs.reduce((n, d) => n + d.c.length, 0), chars: docs.reduce((n, d) => n + d.c.reduce((m, x) => m + x[1].length, 0), 0), ts: Date.now() }));
+}
+
+/* the passages that best answer the last question (plus a little weight for the one before it, for follow-ups) */
+function libSearch(idx, messages, limit = LIB_SEND) {
+  const users = messages.filter((m) => m.role === 'user').slice(-2);
+  const last = users.length ? libTokens(users[users.length - 1].content) : [], prev = users.length > 1 ? libTokens(users[0].content) : [];
+  const q = new Map(), direct = new Set(last.length ? last : prev);
+  const add = (w, x) => { if ((q.get(w) || 0) < x) q.set(w, x); };
+  last.forEach((w) => add(w, 1));
+  prev.forEach((w) => add(w, last.length < 4 ? 0.8 : 0.4));
+  const syn = libSynonyms();
+  for (const [w, x] of [...q]) for (const s of syn[w] || []) add(s, x * 0.4);
+  const N = idx.chunks.length, k1 = 1.2, b = 0.75, score = new Map(), hit = new Map();
+  for (const [w, wt] of q) {
+    const p = idx.inv.get(w); if (!p) continue;
+    const n = p.length / 2, idf = Math.log(1 + (N - n + 0.5) / (n + 0.5));
+    for (let i = 0; i < p.length; i += 2) {
+      const c = p[i], tf = p[i + 1];
+      score.set(c, (score.get(c) || 0) + wt * idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * idx.chunks[c].len / idx.avg)));
+      if (direct.has(w)) hit.set(c, (hit.get(c) || 0) + 1);
+    }
+  }
+  const need = direct.size >= 3 ? 2 : 1; // a passage must really share words with the question, not just a synonym
+  const ranked = [...score].filter(([c]) => (hit.get(c) || 0) >= need).sort((a, b2) => b2[1] - a[1]);
+  if (!ranked.length) return [];
+  const top = ranked[0][1], keep = [], perDoc = new Map(); let used = 0;
+  for (const [c, s] of ranked) {
+    if (s < top * 0.4 || keep.length >= 30) break;
+    const ch = idx.chunks[c];
+    if ((perDoc.get(ch.d) || 0) >= LIB_MAX_PER_DOC || used + ch.text.length > limit) continue;
+    keep.push(c); perDoc.set(ch.d, (perDoc.get(ch.d) || 0) + 1); used += ch.text.length;
+  }
+  const passages = [];
+  for (const c of keep.sort((a, b2) => a - b2)) { // neighbouring passages of one video read better as one
+    const ch = idx.chunks[c], l = passages[passages.length - 1], s = score.get(c);
+    if (l && l.d === ch.d && l.end === ch.ci - 1) { l.text += ' ' + ch.text; l.end = ch.ci; l.s = Math.max(l.s, s); }
+    else passages.push({ d: ch.d, t: ch.t, end: ch.ci, text: ch.text, s });
+  }
+  return passages.sort((a, b2) => b2.s - a.s).slice(0, 40).map((p, i) => ({ ref: 'S' + (i + 1), title: idx.meta[p.d].title, vid: idx.meta[p.d].vid, t: p.t, text: p.text }));
+}
+const libSelect = async (messages) => libSearch(await libGet(), messages);
+
+async function libImportFile(file) {
+  let o; try { o = JSON.parse(await file.text()); } catch (e) { throw new Error('That isn’t a library file (not valid JSON).'); }
+  if (!o || o.lbl !== 'library' || !Array.isArray(o.docs)) throw new Error('That isn’t a video library file. Use the coach-library.json file made for this app.');
+  const docs = []; let chars = 0;
+  for (const d of o.docs) {
+    if (!d || typeof d.id !== 'string' || typeof d.title !== 'string' || !Array.isArray(d.c)) continue;
+    const c = d.c.filter((x) => Array.isArray(x) && Number.isFinite(x[0]) && typeof x[1] === 'string' && x[1].trim()).map((x) => [Math.max(0, Math.floor(x[0])), x[1]]);
+    if (!c.length) continue;
+    chars += c.reduce((n, x) => n + x[1].length, 0);
+    docs.push({ id: d.id.slice(0, 60), title: d.title.slice(0, 200), vid: /^[\w-]{11}$/.test(d.vid || '') ? d.vid : '', c });
+  }
+  if (!docs.length) throw new Error('No videos found in that file.');
+  if (chars > LIB_MAX_CHARS) throw new Error('That library is bigger than this app can search (30 million characters).');
+  try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch (e) { /* ask the browser not to evict it; fine if refused */ }
+  const db = await libDb();
+  try { const tx = db.transaction('docs', 'readwrite'), st = tx.objectStore('docs'); docs.forEach((d) => st.put(d)); await idbDone(tx); } finally { db.close(); }
+  libIndex = null; await libRefreshMeta();
+  return docs.length;
+}
+async function libRemove() {
+  const db = await libDb();
+  try { const tx = db.transaction('docs', 'readwrite'); tx.objectStore('docs').clear(); await idbDone(tx); } finally { db.close(); }
+  libIndex = null; localStorage.removeItem(LIB_META_KEY);
+}
+
+function libCardHtml() {
+  const m = libMeta(), cs = S.coachStyle || {}, on = cs.useLib !== false, strict = cs.ground !== 'prefer';
+  return `<div class="card"><h2>Video library</h2><div class="small muted" style="margin-bottom:10px">Your transcript collection. For every question the coach searches it, answers from the best-matching passages, and shows which videos it used. It stays on this phone; only the matching passages go to Claude, through your proxy, when you ask.</div>
+    ${m.videos ? `<div class="small" style="margin-bottom:12px"><b>${fmtK(m.videos)} videos</b> · ${fmtK(m.passages)} passages · ${(m.chars / 1e6).toFixed(1)}M characters</div>
+      <div class="small muted" style="margin-bottom:6px">Coach uses the library</div>
+      <div class="chips" style="margin-bottom:12px"><button class="pill ${on ? 'on' : ''}" data-act="lib-use" data-v="1">On</button><button class="pill ${on ? '' : 'on'}" data-act="lib-use" data-v="0">Off</button></div>
+      <div class="small muted" style="margin-bottom:6px">If the library doesn’t cover a question</div>
+      <div class="chips" style="margin-bottom:12px"><button class="pill ${strict ? 'on' : ''}" data-act="lib-ground" data-v="strict">Say so (strict)</button><button class="pill ${strict ? '' : 'on'}" data-act="lib-ground" data-v="prefer">Add general knowledge</button></div>`
+      : '<div class="small muted" style="margin-bottom:10px">No library loaded yet.</div>'}
+    <div class="btn-row" style="margin-top:0"><button class="btn primary" data-act="lib-load">${m.videos ? 'Add / update file…' : 'Load library file…'}</button>${m.videos ? '<button class="btn" data-act="lib-try">Try a search</button>' : ''}</div>
+    ${m.videos ? '<button class="btn block" style="margin-top:8px;color:var(--danger)" data-act="lib-remove">Remove library</button>' : ''}
+    <div class="small muted" id="lib-status" style="margin-top:8px">Not included in backups (it’s too big), so keep the library file.</div>
+    <input type="file" id="lib-file" accept=".json,application/json" hidden></div>`;
+}
+
+function libTrySheet() {
+  const el = openLayer(`<div class="sheet-title">Try a search</div>
+    <div class="small muted" style="margin:6px 0 10px">Type a question the way you’d ask the coach. This shows the passages it would read.</div>
+    <div class="field"><input id="lib-q" placeholder="e.g. how many sets should I do for chest?" autocomplete="off"></div>
+    <button class="btn primary block" id="lib-go">Search</button><div id="lib-out" style="margin-top:12px"></div>`);
+  const go = async () => {
+    const q = $('#lib-q', el).value.trim(), out = $('#lib-out', el); if (!q) return;
+    out.innerHTML = '<div class="small muted">Searching…</div>';
+    try {
+      const t0 = performance.now(), ps = await libSelect([{ role: 'user', content: q }]), ms = Math.round(performance.now() - t0);
+      out.innerHTML = ps.length
+        ? `<div class="small muted" style="margin-bottom:8px">${ps.length} passages from ${new Set(ps.map((p) => p.title)).size} videos (${fmtK(ps.reduce((n, p) => n + p.text.length, 0))} characters) in ${ms} ms</div>` + ps.slice(0, 10).map((p) => `<div class="card" style="margin:0 0 8px;padding:10px 12px"><div class="small"><b>${esc(p.title)}</b> · ${mmss(p.t)}</div><div class="small muted" style="margin-top:4px">${esc(p.text.slice(0, 260))}…</div></div>`).join('')
+        : '<div class="small muted">Nothing in your library matched that — the coach would say so.</div>';
+    } catch (e) { out.innerHTML = `<div class="small" style="color:var(--danger)">${esc(e.message)}</div>`; }
+  };
+  $('#lib-go', el).onclick = go;
+  $('#lib-q', el).addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+}
+
+/* under a coach answer: where it came from, with a link to each video at the right moment */
+function sourceRow(m) {
+  const badge = { library: 'From your video library', partly: 'Partly from your library', general: 'Not from your library' }[m.grounding] || '';
+  const links = (m.sources || []).map((s) => {
+    const t = Math.max(0, +s.t || 0), lab = `${esc(s.title)} · ${mmss(t)}`;
+    return /^[\w-]{11}$/.test(s.vid || '') ? `<a class="src-link" href="https://www.youtube.com/watch?v=${s.vid}&t=${t}s" target="_blank" rel="noopener noreferrer">${lab}</a>` : `<span class="src-link">${lab}</span>`;
+  }).join('');
+  return badge || links ? `<div class="src-row">${badge ? `<span class="src-badge ${m.grounding}">${badge}</span>` : ''}${links}</div>` : '';
+}
+
 /* ---------- confirm / menus ---------- */
 function askConfirm(msg, okLabel, fn) {
   const el = openLayer(`<div class="sheet-title">${esc(msg)}</div><div class="btn-row"><button class="btn" data-act="close-layer">Cancel</button><button class="btn primary" id="c-ok">${esc(okLabel)}</button></div>`);
@@ -1447,6 +1649,7 @@ function viewSettings() {
     <div class="field" style="margin-bottom:0"><label>Your coaching principles (optional) — your own notes, in your words</label><textarea data-cs="principles" rows="5" maxlength="2000" placeholder="e.g. Add weight only when I hit the top reps on every set. Keep 1–2 reps in reserve. Don't junk volume.">${esc(S.coachStyle.principles || '')}</textarea></div>
     <button class="btn sm" style="margin-top:8px" data-act="starter-principles">Insert starter principles</button>
     <div class="small muted" style="margin-top:8px">Saved as you type. Your principles take priority over the coach’s default progression rules, but never over safety or your real data.</div></div>
+  ${libCardHtml()}
   ${kbCardHtml()}
   <div class="card"><h2>Food database</h2><div class="small muted" style="margin-bottom:10px">Looks for wrong calories, impossible serving weights, duplicates and uncategorised foods — including the ones you scanned or added here.</div><button class="btn block" data-act="open-check">Check my database</button></div>
   <div class="card"><h2>Backup &amp; export</h2><div class="small muted" style="margin-bottom:10px">Last backup: <b>${last}</b>. Clearing browser data erases everything here, so export now and then and keep the file in Drive/Photos.</div>
@@ -1639,6 +1842,11 @@ const actions = {
   'coach-ask': (el) => coachSend(el.dataset.q),
   'coach-log': (el) => coachLogItems(+el.dataset.m, [+el.dataset.s]),
   'coach-log-all': (el) => { const m = coachMsgs[+el.dataset.m]; if (m) coachLogItems(+el.dataset.m, m.suggestions.map((_, i) => i)); },
+  'lib-load': () => { const f = $('#lib-file'); if (f) f.click(); },
+  'lib-try': () => libTrySheet(),
+  'lib-use': (el) => { S.coachStyle.useLib = el.dataset.v === '1'; save(); render(); toast(S.coachStyle.useLib ? 'Coach will use your video library' : 'Coach will ignore your video library'); },
+  'lib-ground': (el) => { S.coachStyle.ground = el.dataset.v; save(); render(); toast(el.dataset.v === 'strict' ? 'Strict: the coach says when the library doesn’t cover something' : 'The coach may add general knowledge, and will label it'); },
+  'lib-remove': () => askConfirm('Remove the video library from this phone? You can load the file again any time.', 'Remove', async () => { try { await libRemove(); render(); toast('Library removed'); } catch (e) { toast(`Couldn’t remove it: ${e.message}`); } }),
   'kb-add': () => kbSheet(null),
   'kb-edit': (el) => kbSheet(el.dataset.id),
   'kb-toggle': (el) => { const d = S.knowledge.find((x) => x.id === el.dataset.id); if (d) { d.on = d.on === false; save(); render(); } },
@@ -1672,6 +1880,7 @@ document.addEventListener('input', (e) => {
     if (s) { s.exercises[+card.dataset.ei].sets[+col.dataset.si][t.dataset.f] = t.value.replace(',', '.'); saveSoon(); }
   }
   if (t.dataset && t.dataset.cs) { S.coachStyle[t.dataset.cs] = t.value; saveSoon(); }
+  if (t.dataset && t.dataset.scan) { const c = scanCfg(); c[t.dataset.scan] = t.value.replace(/\s+/g, ''); setScanCfg(c); } // save as you type, not only when the box loses focus
   if (t.id === 'w-cardio' && workoutEl) { const s = sessionOn(workoutDate); if (s) { s.cardioMin = parseInt(t.value, 10) || 0; saveSoon(); } }
 });
 // Enter jumps to the same box in the next set (type a whole weights line, like your sheet)
@@ -1691,6 +1900,12 @@ document.addEventListener('change', (e) => {
   if (t.id === 'import-file' && t.files[0]) { importJson(t.files[0]); t.value = ''; }
   if (t.id === 'merge-file' && t.files[0]) { importJson(t.files[0], true); t.value = ''; }
   if (t.dataset && t.dataset.scan) { const clean = t.value.replace(/\s+/g, ''); t.value = clean; const c = scanCfg(); c[t.dataset.scan] = clean; setScanCfg(c); }
+  if (t.id === 'lib-file' && t.files[0]) {
+    const file = t.files[0], st = $('#lib-status'); t.value = '';
+    if (st) st.textContent = 'Loading and saving the library…';
+    libImportFile(file).then(async (n) => { await libGet(); render(); toast(`Library ready: ${fmtK(n)} videos from that file`); })
+      .catch((err) => { if (st) { st.textContent = err.message; st.style.color = 'var(--danger)'; } toast(err.message); });
+  }
   if ((t.id === 'scan-file' || t.id === 'scan-file-gallery') && t.files[0]) { const file = t.files[0]; t.value = ''; handleScan(file); }
 });
 window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); deferredInstall = e; if (tab === 'settings') afterSettings(); });
