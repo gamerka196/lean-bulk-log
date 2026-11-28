@@ -255,3 +255,19 @@ body.has-add #toast { bottom: calc(80px + env(safe-area-inset-bottom)); }
 .src-badge.general { border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); color: var(--warn); }
 .src-link { padding: 3px 9px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); color: var(--text); text-decoration: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 a.src-link:active { background: var(--card2); }
+
+/* cut plan: day-type label, weight card, check-ins, plan targets grid, progression line */
+.daykind { display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .4px; text-transform: uppercase; padding: 3px 10px; border-radius: 999px; margin-bottom: 10px; background: var(--card2); color: var(--muted); }
+.daykind.lift { background: var(--accent); color: #fff; }
+.wt-head { display: flex; justify-content: space-between; align-items: center; }
+.wt-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.wt-row input { flex: 1; min-width: 0; padding: 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--card2); font: inherit; font-size: 18px; outline: none; }
+.advice { margin: 12px 0 0; padding: 12px 14px; border-radius: 14px; background: var(--card2); font-size: 14px; line-height: 1.4; border-left: 4px solid var(--line); }
+.advice.add, .advice.cut { border-left-color: var(--accent); }
+.advice.ok { border-left-color: var(--accent); }
+.ptgrid { display: grid; grid-template-columns: 1fr 96px 96px; gap: 8px 10px; align-items: center; }
+.ptgrid b { font-size: 12.5px; text-align: center; color: var(--muted); font-weight: 600; }
+.ptgrid input { padding: 10px; border-radius: 12px; border: 1px solid var(--line); background: var(--card2); text-align: right; width: 100%; outline: none; font: inherit; }
+.xprog { font-size: 12.5px; color: var(--muted); margin: 0 0 8px; }
+.xprog.up { color: var(--accent); font-weight: 600; }
+.src-badge.program { background: color-mix(in srgb, var(--accent) 18%, var(--card)); border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); color: var(--accent); }

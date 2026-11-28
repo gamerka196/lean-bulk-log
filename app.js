@@ -68,6 +68,75 @@ function totalsOf(entries) {
 }
 const dayTotals = (d) => totalsOf(S.log[d] || []);
 
+/* ---------- CUT PLAN: targets by day type (calendar), weight target, weekly check-ins ----------
+   The numbers themselves come from a private program file (Settings -> Program); nothing personal is in this code. */
+const planOn = (d) => !!(S.plan && S.plan.start && S.plan.lift && S.plan.off && d >= S.plan.start);
+const isLiftDay = (d) => !!(S.plan && (S.plan.liftDays || []).includes(parseYmd(d).getDay()));
+/* the targets for a date: the plan's lifting-day or off-day numbers once the plan has started (by weekday, whether or not
+   you actually trained), otherwise the single old target. The sugar limit is always the one you set in Settings. */
+function targetsOn(d) {
+  if (!planOn(d)) return S.targets;
+  const p = S.plan[isLiftDay(d) ? 'lift' : 'off'];
+  return { k: p.k, p: p.p, c: p.c, f: p.f, s: S.targets.s };
+}
+const dayKind = (d) => (planOn(d) ? (isLiftDay(d) ? 'Lifting day' : 'Off day') : '');
+const wtOn = (d) => { const v = S.weights && S.weights[d]; return v > 0 ? v : 0; };
+const meanOf = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+/* weight the plan expects by the END of week k (compounding weekly pace, stops at the goal) and for a given day (straight line inside the week) */
+function weekEndTarget(k) {
+  const p = S.plan; if (!p || !p.startWeight || !p.pace) return null;
+  return Math.max(p.goalWeight || 0, p.startWeight * Math.pow(1 - p.pace, k));
+}
+function weightTargetOn(d) {
+  const p = S.plan; if (!planOn(d) || !p.startWeight || !p.pace) return null;
+  const n = Math.round((parseYmd(d) - parseYmd(p.start)) / 864e5), k = Math.floor(n / 7), i = n % 7;
+  const raw = (n2) => p.startWeight * Math.pow(1 - p.pace, n2), w0 = raw(k), w1 = raw(k + 1); // same as the sheet: the straight line is drawn first, then stopped at the goal
+  return Math.max(p.goalWeight || 0, w0 + (w1 - w0) * (i + 1) / 7);
+}
+function avgWeight(d, days = 7) {
+  const a = [...Array(days)].map((_, i) => wtOn(addDays(d, -i))).filter(Boolean);
+  return a.length ? meanOf(a) : 0;
+}
+/* one row per plan week (Mon-Sun) up to this week: average weight vs target, change vs last week, average food */
+function checkinWeeks() {
+  const p = S.plan; if (!p || !p.start) return [];
+  const today = todayStr(), rows = [];
+  for (let k = 1, ws = p.start; ws <= today && k <= 80; k++, ws = addDays(ws, 7)) {
+    const days = [...Array(7)].map((_, i) => addDays(ws, i)), sun = days[6];
+    const wts = days.map(wtOn).filter(Boolean), eaten = days.filter((d) => d <= today && (S.log[d] || []).length);
+    rows.push({
+      k, ws, we: sun, complete: sun < today || wtOn(sun) > 0, n: wts.length, avg: wts.length >= 3 ? meanOf(wts) : null, target: weekEndTarget(k),
+      kcal: eaten.length ? meanOf(eaten.map((d) => dayTotals(d).k)) : null, protein: eaten.length ? meanOf(eaten.map((d) => dayTotals(d).p)) : null, logged: eaten.length,
+    });
+  }
+  rows.forEach((r, i) => { r.prev = i ? rows[i - 1].avg : p.startWeight; r.change = r.avg != null && r.prev != null ? r.avg - r.prev : null; });
+  return rows;
+}
+/* your sheet's rules: judge from week 3; under ~1 lb/week for 2 weeks in a row -> cut 150 kcal; over ~2 lb/week -> add 150 kcal */
+function checkinAdvice(rows) {
+  const done = rows.filter((r) => r.complete && r.avg != null);
+  if (!done.length) return { kind: 'none', text: 'Weigh in on waking at least 3 days a week. Your first check-in appears after your first full week (Monday to Sunday).' };
+  const last = done[done.length - 1], after = (S.plan && S.plan.adjAfterWeek) || 0;
+  if (last.k < 3) return { kind: 'wait', text: 'Weeks 1 and 2 drop faster (water and stored carbs). Judge the pace from week 3.' };
+  const lost = (r) => (r && r.change != null ? -r.change : null);
+  if (last.k > after && lost(last) != null && lost(last) > 2) {
+    return { kind: 'add', delta: 150, week: last.k, text: `You lost ${fmt(lost(last))} lb in week ${last.k}, more than about 2 lb. Your sheet says add 150 kcal (from carbs).` };
+  }
+  const prior = rows.find((r) => r.k === last.k - 1);
+  if (prior && prior.k >= 3 && prior.k > after && last.k > after && lost(last) != null && lost(prior) != null && lost(last) < 1 && lost(prior) < 1) {
+    return { kind: 'cut', delta: -150, week: last.k, text: `Under about 1 lb a week two weeks running (${fmt(lost(prior))} and ${fmt(lost(last))} lb). Your sheet says cut 150 kcal (from carbs).` };
+  }
+  return { kind: 'ok', text: 'On pace. No change needed.' };
+}
+function applyAdjust(delta, week) {
+  const p = S.plan; if (!p) return;
+  const before = JSON.stringify(p);
+  for (const t of [p.lift, p.off]) { t.k += delta; t.c = Math.max(0, Math.round((t.k - t.p * 4 - t.f * 9) / 4)); }
+  p.adjAfterWeek = week; (p.adjLog = p.adjLog || []).push({ date: todayStr(), delta, week });
+  save(); closeLayer(); refresh();
+  toast(`${delta > 0 ? 'Added' : 'Cut'} 150 kcal on both day types`, () => { S.plan = JSON.parse(before); save(); refresh(); });
+}
+
 function amountLabel(e) {
   if (isPureG(e.serving) && e.g) return `${fmt(e.qty * e.g)} g`;
   if (Math.abs(e.qty - 1) < 1e-6) return e.serving;
@@ -233,7 +302,7 @@ function relLabel(d) {
 }
 
 function viewToday() {
-  const d = viewDate, es = entriesOf(d), t = totalsOf(es), T = S.targets;
+  const d = viewDate, es = entriesOf(d), t = totalsOf(es), T = targetsOn(d), kind = dayKind(d);
   const left = T.k - t.k, over = left < 0, pct = Math.min(1, t.k / T.k);
   const R = 54, C = 2 * Math.PI * R;
   const mac = (m, label) => {
@@ -256,14 +325,15 @@ function viewToday() {
 
   if (stale) html += `<div class="card banner"><div><b>Back up your data</b><div class="small muted">It only lives on this phone.</div></div><button class="btn primary" data-act="export-json">Export</button></div>`;
 
-  html += `<div class="card"><div class="sum">
+  html += `<div class="card">${kind ? `<div class="daykind ${isLiftDay(d) ? 'lift' : 'off'}">${kind} · ${fmtK(T.k)} kcal</div>` : ''}<div class="sum">
     <div class="ringbox"><svg class="ring" viewBox="0 0 140 140"><circle class="ring-bg" cx="70" cy="70" r="${R}"/><circle class="ring-fg ${over ? 'over' : ''}" cx="70" cy="70" r="${R}" stroke-dasharray="${pct * C} ${C}" transform="rotate(-90 70 70)"/></svg>
       <div class="ringtxt"><b>${fmtK(Math.abs(left))}</b><span>${over ? 'kcal over' : 'kcal left'}</span></div></div>
     <div class="macros">${mac('p', 'Protein')}${mac('c', 'Carbs')}${mac('f', 'Fat')}</div></div>
     <div class="sugar"><span>${fmtK(t.k)} of ${fmtK(T.k)} kcal</span><span>Sugar ${fmt(t.s)} / ${T.s} g</span></div></div>`;
 
-  const pd = plannedDay(d), ss = sessionOn(d);
-  html += `<button class="card coach-card" data-act="goto-train"><span class="coach-ic">${DUMBBELL_SVG}</span><span style="flex:1;min-width:0"><b>${ss ? `${esc(ss.dayName)} ${ss.finishedAt ? '✓ done' : '· in progress'}` : pd ? `Up next: ${esc(pd.name)}` : 'Workouts'}</b><span class="small muted" style="display:block">${ss ? `${doneSets(ss)}/${totalSets(ss)} sets · ${fmtK(volumeOf(ss))} lb` : pd ? `${pd.exercises.length} exercises — tap to open Train` : 'Open Train to log a workout'}</span></span><span class="muted">›</span></button>`;
+  html += weightCard(d);
+  const pd = plannedDay(d), ss = sessionOn(d), fixed = !!W().routine.fixed, rn = restNote(d);
+  html += `<button class="card coach-card" data-act="goto-train"><span class="coach-ic">${DUMBBELL_SVG}</span><span style="flex:1;min-width:0"><b>${ss ? `${esc(ss.dayName)} ${ss.finishedAt ? '✓ done' : '· in progress'}` : pd ? `${fixed ? 'Today' : 'Up next'}: ${esc(pd.name)}` : rn ? 'No lifting today' : 'Workouts'}</b><span class="small muted" style="display:block">${ss ? `${doneSets(ss)}/${totalSets(ss)} sets · ${fmtK(volumeOf(ss))} lb` : pd ? `${pd.exercises.length} exercises — tap to open Train` : rn ? esc(rn) : 'Open Train to log a workout'}</span></span><span class="muted">›</span></button>`;
   const pLeft = T.p - t.p;
   html += `<button class="card coach-card" data-act="open-coach"><span class="coach-ic">${CHAT_SVG}</span><span style="flex:1;min-width:0"><b>Ask your coach</b><span class="small muted" style="display:block">${pLeft > 1 ? `${fmt(pLeft)} g protein to go — what should you eat?` : 'Targets covered — ask about tomorrow or a snack'}</span></span><span class="muted">›</span></button>`;
 
@@ -290,23 +360,72 @@ function viewToday() {
   return html;
 }
 
+/* ---------- WEIGHT: morning weigh-in card and weekly check-ins ---------- */
+let weightEdit = false;
+function restNote(d) {
+  const r = W().routine;
+  return r.fixed && !plannedDay(d) ? ((r.rest && r.rest[dowOf(d)]) || 'No session scheduled today.') : '';
+}
+function weightCard(d) {
+  if (!S.plan && !Object.keys(S.weights).length) return '';
+  const w = wtOn(d), tg = weightTargetOn(d), a7 = avgWeight(d);
+  let body;
+  if (w && !weightEdit) {
+    const diff = tg ? w - tg : null;
+    body = `<div class="wt-row"><div><b style="font-size:26px;letter-spacing:-.3px">${fmt(w)}</b> <span class="muted">lb</span>
+      <div class="small muted">${tg ? `target ${fmt(tg)} lb · ${Math.abs(diff) < 0.05 ? 'right on it' : `${fmt(Math.abs(diff))} lb ${diff > 0 ? 'above' : 'below'}`}` : 'logged'}</div></div>
+      <button class="btn sm" data-act="weight-edit">Edit</button></div>`;
+  } else {
+    body = `<div class="wt-row"><input id="wt-in" inputmode="decimal" enterkeyhint="done" placeholder="${a7 ? fmt(a7) : 'e.g. 198.4'}" value="${w ? fmt(w) : ''}" aria-label="Morning weight in pounds"><button class="btn primary sm" data-act="weight-save">Save</button></div>
+      <div class="small muted" style="margin-top:6px">On waking, after the bathroom, before food.${tg ? ` Target today: ${fmt(tg)} lb.` : ''}</div>`;
+  }
+  return `<div class="card"><div class="wt-head"><h2>Morning weight</h2>${S.plan ? '<button class="ghost" data-act="open-checkins" style="padding:0">Check-ins ›</button>' : ''}</div>${body}
+    ${a7 ? `<div class="small muted" style="margin-top:6px">7-day average ${fmt(a7)} lb · judge the trend, not one morning</div>` : ''}</div>`;
+}
+function saveWeight() {
+  const inp = $('#wt-in'); if (!inp) return;
+  const raw = inp.value.trim();
+  if (!raw) { delete S.weights[viewDate]; weightEdit = false; save(); refresh(); toast('Weight cleared'); return; }
+  const v = parseFloat(raw.replace(',', '.'));
+  if (!Number.isFinite(v) || v < 80 || v > 600) { toast('Enter your weight in pounds, like 198.4'); return; }
+  S.weights[viewDate] = Math.round(v * 10) / 10; weightEdit = false; save(); refresh();
+  const tg = weightTargetOn(viewDate);
+  toast(tg ? `Saved ${fmt(S.weights[viewDate])} lb · target ${fmt(tg)}` : `Saved ${fmt(S.weights[viewDate])} lb`);
+}
+function checkinsSheet() {
+  const rows = checkinWeeks(), adv = checkinAdvice(rows), p = S.plan;
+  const wk = (r) => `${dayName(r.ws, { month: 'short', day: 'numeric' })} – ${dayName(r.we, { month: 'short', day: 'numeric' })}`;
+  const list = rows.slice().reverse().map((r) => {
+    const gap = r.avg != null && r.target != null ? r.avg - r.target : null;
+    return `<div class="row"><div class="row-main"><div class="name">Week ${r.k}${r.complete ? '' : ' · so far'} <span class="muted small">${wk(r)}</span></div>
+      <div class="sub">${r.avg != null ? `avg ${fmt(r.avg)} lb · target ${fmt(r.target)}${gap != null ? ` (${gap > 0 ? '+' : ''}${fmt(gap)})` : ''}${r.change != null ? ` · ${r.change > 0 ? '+' : ''}${fmt(r.change)} vs ${r.k === 1 ? 'start' : 'last week'}` : ''}` : `${r.n} weigh-in${r.n === 1 ? '' : 's'} so far · need 3 for an average`}</div></div>
+      <div class="row-right"><div class="kcal">${r.kcal != null ? fmtK(r.kcal) : '–'}</div><div class="mini">${r.protein != null ? `P ${fmtK(r.protein)} · ` : ''}${r.logged}/7 days</div></div></div>`;
+  }).join('') || '<div class="empty">The first week starts on ' + dayName(p.start, { weekday: 'long', month: 'short', day: 'numeric' }) + '.</div>';
+  openLayer(`<div class="sheet-title">Weekly check-ins</div>
+    <div class="muted small">Weeks run Monday to Sunday. Pace: about ${fmt(p.startWeight * p.pace)} lb a week${p.goalWeight ? ` toward ${fmt(p.goalWeight)} lb` : ''}. Start: ${fmt(p.startWeight)} lb${p.startDate ? ` (${dayName(p.startDate, { month: 'short', day: 'numeric' })})` : ''}.</div>
+    <div class="advice ${adv.kind}"><div>${esc(adv.text)}</div>${adv.delta ? `<button class="btn ${adv.delta > 0 ? '' : 'primary'} sm" data-act="adjust-apply" data-delta="${adv.delta}" data-week="${adv.week}" style="margin-top:8px">${adv.delta > 0 ? 'Add' : 'Cut'} 150 kcal on both day types</button>` : ''}</div>
+    <div class="list" style="margin:10px 0 0">${list}</div>
+    <div class="muted small" style="margin-top:10px">If strength drops on several main lifts for 2+ weeks, your sheet says add 100–150 kcal from carbs on lifting days. Calories: lifting ${fmtK(p.lift.k)} · off ${fmtK(p.off.k)}.</div>`);
+}
+
 /* ---------- HISTORY ---------- */
 function viewHistory() {
-  const T = S.targets;
   const days = Object.keys(S.log).filter((d) => S.log[d].length).sort().reverse();
   const cut = addDays(todayStr(), -6);
   const wk = days.filter((d) => d >= cut && d <= todayStr());
   const avg = (m) => (wk.length ? wk.reduce((a, d) => a + dayTotals(d)[m], 0) / wk.length : 0);
-  const hit = (d) => { const t = dayTotals(d); return t.k >= T.k * 0.95 && t.p >= T.p * 0.95; };
+  const avgT = (m) => (wk.length ? wk.reduce((a, d) => a + targetsOn(d)[m], 0) / wk.length : 0); // the plan's target changes with the day type
+  const hit = (d) => { const t = dayTotals(d), T = targetsOn(d); return t.k >= T.k * 0.95 && t.p >= T.p * 0.95; };
   let html = `<div class="top"><div><h1>History</h1><div class="sub">${days.length} days logged</div></div></div>`;
+  if (S.plan) html += `<button class="card coach-card" data-act="open-checkins"><span class="coach-ic" style="font-size:20px">⚖</span><span style="flex:1;min-width:0"><b>Weekly check-ins</b><span class="small muted" style="display:block">Weight average vs your target, and when to adjust calories</span></span><span class="muted">›</span></button>`;
   html += `<div class="card"><h2>Last 7 days${wk.length ? ` · ${wk.length} logged` : ''}</h2>${wk.length ? `
-    <div class="stat"><div><b>${fmtK(avg('k'))}</b><span>avg kcal<br>target ${fmtK(T.k)}</span></div>
-    <div><b class="p-c">${fmtK(avg('p'))} g</b><span>avg protein<br>target ${T.p} g</span></div>
+    <div class="stat"><div><b>${fmtK(avg('k'))}</b><span>avg kcal<br>target ${fmtK(avgT('k'))}</span></div>
+    <div><b class="p-c">${fmtK(avg('p'))} g</b><span>avg protein<br>target ${fmtK(avgT('p'))} g</span></div>
     <div><b>${wk.filter(hit).length}/${wk.length}</b><span>days on target<br>kcal + protein</span></div></div>`
     : '<div class="muted">Log a few days and your averages show up here.</div>'}</div>`;
   html += `<div class="list" style="margin-top:12px">`;
   for (const d of days.slice(0, 90)) {
-    const t = dayTotals(d);
+    const t = dayTotals(d), T = targetsOn(d);
     html += `<button class="row" data-act="goto-day" data-d="${d}"><div class="row-main hist">
       <div class="line"><b>${dayName(d, { weekday: 'short', month: 'short', day: 'numeric' })}${hit(d) ? ' <span style="color:var(--accent)">✓</span>' : ''}</b>
       <span><b>${fmtK(t.k)}</b> <span class="muted small">/ ${fmtK(T.k)}</span></span></div>
@@ -442,7 +561,7 @@ function renderAddBody() {
 
 function renderAddFoot() {
   const foot = $('#add-foot', addEl); if (!foot) return;
-  const t = dayTotals(viewDate), T = S.targets;
+  const t = dayTotals(viewDate), T = targetsOn(viewDate);
   const rem = (m) => fmt(T[m] - t[m]);
   foot.innerHTML = `<div><div class="small muted">${viewDate === todayStr() ? 'Left today' : 'Left on ' + dayName(viewDate, { month: 'short', day: 'numeric' })}</div>
     <div class="nums"><b>${fmtK(T.k - t.k)} kcal</b><b class="p-c">P ${rem('p')}</b><b class="c-c">C ${rem('c')}</b><b class="f-c">F ${rem('f')}</b></div></div>
@@ -620,12 +739,31 @@ function coachSave() {
   try { localStorage.setItem(COACH_KEY, JSON.stringify({ date: coachDate, msgs: coachMsgs.slice(-40) })); } catch (e) { /* conversation just won't persist */ }
 }
 
+/* the plan, as the coach needs it: today's day type, weight vs target, recent check-ins, and whether a calorie change is due */
+function planContext(date) {
+  const p = S.plan; if (!p || !planOn(date)) return undefined;
+  const rows = checkinWeeks(), adv = checkinAdvice(rows), r1x = (n) => (n == null ? undefined : Math.round(n * 10) / 10);
+  const tg = (t) => ({ kcal: t.k, protein_g: t.p, carbs_g: t.c, fat_g: t.f });
+  const names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  return {
+    name: p.name, started: p.start, day_type_today: dayKind(date).toLowerCase(), lifting_days: (p.liftDays || []).map((i) => names[i]),
+    targets_by_day_type: { lifting_day: tg(p.lift), off_day: tg(p.off) },
+    weight: { logged_today_lb: wtOn(date) || undefined, target_today_lb: r1x(weightTargetOn(date)), last_7_day_average_lb: r1x(avgWeight(date) || null), start_lb: p.startWeight, goal_lb: p.goalWeight, planned_loss_pct_per_week: r1x(p.pace * 100) },
+    check_ins: rows.slice(-4).map((r) => ({ week: r.k, complete: r.complete, avg_weight_lb: r1x(r.avg), target_by_end_of_week_lb: r1x(r.target), change_vs_previous_lb: r1x(r.change), avg_kcal: r.kcal == null ? undefined : Math.round(r.kcal), avg_protein_g: r1x(r.protein), days_logged: r.logged })),
+    calorie_adjustment_due: adv.kind === 'add' || adv.kind === 'cut' ? adv.text : undefined,
+    pace_note: adv.kind === 'wait' || adv.kind === 'none' ? adv.text : undefined,
+  };
+}
+const planRules = () => (S.plan && Array.isArray(S.plan.rules) ? S.plan.rules.join('\n').slice(0, 4000) : '');
+
 function coachContext(date) {
-  const T = S.targets, es = entriesOf(date), t = totalsOf(es), r = (n) => Math.round(n * 10) / 10;
+  const T = targetsOn(date), es = entriesOf(date), t = totalsOf(es), r = (n) => Math.round(n * 10) / 10;
   const days = [...Array(7)].map((_, i) => addDays(todayStr(), -i - 1)).filter((d) => (S.log[d] || []).length);
   const avg = (m) => days.reduce((a, d) => a + dayTotals(d)[m], 0) / days.length;
   return {
-    date, isToday: date === todayStr(), localTime: new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }), goal: 'lean bulk',
+    date, isToday: date === todayStr(), localTime: new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
+    goal: planOn(date) ? S.plan.name.toLowerCase() : S.plan ? `lean bulk (the ${S.plan.name.toLowerCase()} plan starts ${S.plan.start})` : 'lean bulk',
+    plan: planContext(date),
     targets: { kcal: T.k, protein_g: T.p, carbs_g: T.c, fat_g: T.f, sugar_limit_g: T.s },
     eaten: { kcal: Math.round(t.k), protein_g: r(t.p), carbs_g: r(t.c), fat_g: r(t.f), sugar_g: r(t.s) },
     remaining: { kcal: Math.round(T.k - t.k), protein_g: r(T.p - t.p), carbs_g: r(T.c - t.c), fat_g: r(T.f - t.f) },
@@ -661,7 +799,7 @@ async function coachSend(text) {
     const timer = setTimeout(() => ctrl.abort(), 90000);
     let res;
     try {
-      res = await fetch(chatUrl(), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': cfg.token }, body: JSON.stringify({ messages, context: coachContext(coachDate), ...coachStyleBody(), knowledge: kbSelect(messages), ...(library ? { library, ground: libStrict() ? 'strict' : 'prefer' } : {}) }), signal: ctrl.signal });
+      res = await fetch(chatUrl(), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-App-Token': cfg.token }, body: JSON.stringify({ messages, context: coachContext(coachDate), ...coachStyleBody(), program: planRules() || undefined, knowledge: kbSelect(messages), ...(library ? { library, ground: libStrict() ? 'strict' : 'prefer' } : {}) }), signal: ctrl.signal });
     } finally { clearTimeout(timer); }
     const data = await res.json().catch(() => null);
     if (!data || !data.ok) throw new Error((data && data.error) || `Coach server error (${res.status})`);
@@ -721,7 +859,7 @@ function delByExercise(id) { delete W().nextWeights[id]; }
 
 function renderCoachHead() {
   const left = $('#coach-left', coachEl); if (!left) return;
-  const t = dayTotals(coachDate), T = S.targets, rem = (m) => fmt(T[m] - t[m]);
+  const t = dayTotals(coachDate), T = targetsOn(coachDate), rem = (m) => fmt(T[m] - t[m]);
   left.innerHTML = `<span class="small muted">${coachDate === todayStr() ? 'Left today' : 'Left on ' + dayName(coachDate, { month: 'short', day: 'numeric' })}</span>
     <span class="nums"><b>${fmtK(T.k - t.k)} kcal</b><b class="p-c">P ${rem('p')}</b><b class="c-c">C ${rem('c')}</b><b class="f-c">F ${rem('f')}</b></span>`;
 }
@@ -778,8 +916,8 @@ const EX = (id, name, sets, variants) => ({ id, name, sets, variants: variants |
 const ROUTINE_VERSION = 4; // v4: bar dips replace close-grip bench; v3: no abs; v2: arms live only on the Arms day
 const OLD_ROUTINE_HASHES = [1551759032, -964817554, 1172889878]; // fingerprints of the untouched v1/v2/v3 routines: only an unedited routine gets upgraded
 const DEFAULT_REPS = [12, 10, 8, 8]; // rep target per set until you set your own (Train -> Routine)
-const repsFor = (ex, i) => { const a = ex.reps && ex.reps.length ? ex.reps : DEFAULT_REPS; return a[i] !== undefined ? a[i] : a[a.length - 1]; };
-const repsList = (ex) => Array.from({ length: ex.sets }, (_, i) => repsFor(ex, i));
+const repsFor = (ex, i) => { if (ex.range) return ex.range[0]; const a = ex.reps && ex.reps.length ? ex.reps : DEFAULT_REPS; return a[i] !== undefined ? a[i] : a[a.length - 1]; }; // a range exercise starts at the bottom of its range
+const repsList = (ex) => (ex.range ? Array.from({ length: ex.sets }, () => `${ex.range[0]}-${ex.range[1]}`) : Array.from({ length: ex.sets }, (_, i) => repsFor(ex, i)));
 const DEFAULT_ROUTINE = {
   v: ROUTINE_VERSION,
   days: [
@@ -834,18 +972,22 @@ function ensureWorkouts() {
   w.sessions = w.sessions || {}; w.baseline = w.baseline || {}; w.prefs = w.prefs || { rest: 90 }; w.nextWeights = w.nextWeights || {};
   if (!S.coachStyle || typeof S.coachStyle !== 'object') S.coachStyle = { preset: 'default', custom: '', principles: '' };
   if (!Array.isArray(S.knowledge)) S.knowledge = [];
+  if (!S.weights || typeof S.weights !== 'object') S.weights = {};
   return w;
 }
 const W = () => ensureWorkouts();
 const dowOf = (d) => parseYmd(d).getDay();
-/* Rotation: the next workout is whichever day follows the one you last trained, not a fixed weekday. */
+/* Rotation (older routines): the next workout is whichever day follows the one you last trained. A routine with fixed:true uses weekdays instead. */
 function plannedDay(d) {
   const w = W(), days = w.routine.days;
   if (!days.length) return null;
+  if (w.routine.fixed) return days.find((x) => x.dow === dowOf(d)) || null; // fixed weekdays: the session for that weekday, or none
   const prior = Object.keys(w.sessions).filter((x) => x < d && doneSets(w.sessions[x]) > 0).sort().pop();
   const i = prior ? days.findIndex((x) => x.id === w.sessions[prior].dayId) : -1;
   return days[(i + 1) % days.length];
 }
+const weekOf = (d) => addDays(d, -((dowOf(d) + 6) % 7)); // the Monday of d's week
+const dayOfEx = (id) => { const d = W().routine.days.find((x) => x.exercises.some((e) => e.id === id)); return d ? d.name : ''; };
 function lastDoneByDay() {
   const out = {};
   for (const d of Object.keys(W().sessions).sort()) if (doneSets(W().sessions[d]) > 0) out[W().sessions[d].dayId] = d;
@@ -891,8 +1033,16 @@ function nextVariant(ex, date) {
   const i = ex.variants.indexOf(lastVariant(ex.id, date)); // alternate week to week; unknown -> first
   return ex.variants[(i + 1) % ex.variants.length];
 }
+/* your sheet's rule: when EVERY working set reached the top of the rep range, add the jump next session; otherwise repeat the weight and keep adding reps */
+function progression(ex, last) {
+  if (!ex.range || !last || !last.length) return null;
+  const hi = ex.range[1], jump = ex.jump || 0;
+  const hitTop = last.length >= ex.sets && last.every((s) => numOf(s.r) >= hi);
+  return { hitTop, jump, hi, up: hitTop && jump > 0 };
+}
+const restFor = (e) => { const ex = findExercise(e.exId); return ex && ex.restSec ? ex.restSec : W().prefs.rest; };
 function prefillSets(ex, v, date, n) {
-  const last = priorSets(ex.id, v, date);
+  const last = priorSets(ex.id, v, date), prog = progression(ex, last);
   const base = !ex.variants.length || v === ex.variants[0] ? W().baseline[ex.id] : null;
   const out = [];
   let pw = '', pr = '';
@@ -901,8 +1051,9 @@ function prefillSets(ex, v, date, n) {
     const b = base && base.length ? (base[i] !== undefined ? base[i] : base[base.length - 1]) : null;
     const nwList = W().nextWeights[ex.id]; // weights the coach suggested and you accepted win over everything else
     const nw = nwList && nwList.length ? (nwList[i] !== undefined ? nwList[i] : nwList[nwList.length - 1]) : null;
-    const w = nw !== null ? nw : l ? l.w : b !== null && b !== undefined ? b : pw;
-    const r = l ? l.r : repsFor(ex, i); // last session's reps, else the exercise's rep scheme (12/10/8/8 by default)
+    const lw = l ? (prog && prog.up && numOf(l.w) > 0 ? String(Math.round((numOf(l.w) + prog.jump) * 100) / 100) : l.w) : null; // top of the range on every set last time: add the jump
+    const w = nw !== null ? nw : lw !== null ? lw : b !== null && b !== undefined ? b : pw;
+    const r = l && !(prog && prog.up) ? l.r : repsFor(ex, i); // last session's reps, else the exercise's rep scheme (12/10/8/8 by default; the bottom of a range)
     out.push({ w, r, done: false });
     pw = w; pr = r;
   }
@@ -957,10 +1108,15 @@ function exerciseCard(s, e, ei) {
   const ex = findExercise(e.exId), variants = ex ? ex.variants : [];
   const last = priorSets(e.exId, e.variant, workoutDate), base = W().baseline[e.exId];
   const hint = last && last.length ? `Last time: ${setTxt(last)}` : base && (!variants.length || e.variant === variants[0]) ? `Starting weights from your sheet: ${base.map((x) => fmt(x)).join(' · ')}` : 'First time — enter your weights and reps once.';
+  const prog = ex && ex.range ? progression(ex, last) : null;
+  const target = ex && ex.range ? `Target ${ex.range[0]}–${ex.range[1]} reps${ex.rest ? ` · rest ${ex.rest}` : ''}${ex.note ? ` · ${ex.note}` : ''}` : '';
+  const pline = !ex || !ex.range ? '' : !prog ? 'Straight sets: same weight on every set.' : prog.up ? `Every set reached ${prog.hi} last time, so +${prog.jump} lb today.` : prog.hitTop ? `Every set reached ${prog.hi}: make it harder (reps, tempo or load).` : `Not at ${prog.hi} on every set yet: same weight, add reps.`;
   return `<div class="xcard" data-ei="${ei}">
     <div class="xhead"><b>${esc(e.variant || e.name)}</b><button class="ghost sm0" data-act="ex-progress" data-id="${esc(e.exId)}">History</button></div>
     ${variants.length > 1 ? `<div class="chips" style="margin:6px 0">${variants.map((v) => `<button class="pill sm1 ${v === e.variant ? 'on' : ''}" data-act="w-variant" data-v="${esc(v)}">${esc(v)}</button>`).join('')}</div>` : ''}
+    ${target ? `<div class="xlast" style="margin-bottom:2px">${esc(target)}</div>` : ''}
     <div class="xlast">${esc(hint)}</div>
+    ${pline ? `<div class="xprog ${prog && prog.up ? 'up' : ''}">${esc(pline)}</div>` : ''}
     <div class="sgrid">
       <div class="lbls"><span></span><span>lb</span><span>reps</span><span></span></div>
       ${e.sets.map((st, si) => `<div class="scol ${st.done ? 'done' : ''}" data-si="${si}"><span class="sn">${si + 1}</span>
@@ -1017,7 +1173,7 @@ function toggleDone(col) {
   if (nxt && !nxt.done && nxt.w === '' && set.w !== '') nxt.w = set.w;
   save(); repaintCard(ei); updateWorkoutClock();
   if (had > 0 && e1rm(numOf(set.w), numOf(set.r)) > prev) prToast(e, set);
-  startRest(W().prefs.rest);
+  startRest(restFor(e));
 }
 
 /* one tap logs the whole exercise exactly as shown (the usual case); edit any box first if a set differed */
@@ -1048,7 +1204,7 @@ function finishSheet() {
 }
 
 function viewTrain() {
-  const w = W(), today = todayStr(), planned = plannedDay(today), sess = sessionOn(today);
+  const w = W(), today = todayStr(), planned = plannedDay(today), sess = sessionOn(today), fixed = !!w.routine.fixed;
   let html = `<div class="top"><div><h1>Train</h1><div class="sub">${dayName(today, { weekday: 'long', month: 'short', day: 'numeric' })}</div></div><button class="btn" data-act="edit-routine">Routine</button></div>`;
   if (sess) {
     const n = doneSets(sess);
@@ -1057,14 +1213,26 @@ function viewTrain() {
       <button class="btn primary block" data-act="w-open" data-d="${today}">${sess.finishedAt ? 'View / edit' : 'Continue workout'}</button></div>`;
   } else if (planned) {
     const lastDone = lastDoneByDay()[planned.id];
-    html += `<div class="card"><h2>Up next</h2><div style="font-size:19px;font-weight:700">${esc(planned.name)}</div>
+    html += `<div class="card"><h2>${fixed ? 'Today' : 'Up next'}</h2><div style="font-size:19px;font-weight:700">${esc(planned.name)}${planned.sub ? ` <span class="muted small" style="font-weight:500">${esc(planned.sub)}</span>` : ''}</div>
       <div class="muted small" style="margin:4px 0 12px">${planned.exercises.map((x) => esc(x.name.split(' / ')[0])).join(' · ')}${lastDone ? ` · last done ${dayName(lastDone, { month: 'short', day: 'numeric' })}` : ''}</div>
       <button class="btn primary block" data-act="w-start" data-day="${planned.id}">Start ${esc(planned.name)}</button>
-      <div class="small muted" style="margin-top:8px">Workouts follow a rotation, not the calendar. Skip a day and the next one simply waits for you.</div></div>`;
+      ${fixed ? '' : '<div class="small muted" style="margin-top:8px">Workouts follow a rotation, not the calendar. Skip a day and the next one simply waits for you.</div>'}</div>`;
+  } else if (fixed) {
+    html += `<div class="card"><h2>Today</h2><div style="font-size:19px;font-weight:700">No lifting today</div><div class="muted small" style="margin-top:4px">${esc(restNote(today))}</div></div>`;
   }
   html += `<button class="card coach-card" data-act="open-coach"><span class="coach-ic">${CHAT_SVG}</span><span style="flex:1;min-width:0"><b>Ask your coach about your lifts</b><span class="small muted" style="display:block">Weight progression, plateaus, what to add next</span></span><span class="muted">›</span></button>`;
   const lastBy = lastDoneByDay();
-  html += `<div class="list"><div class="list-h"><h2>Rotation</h2></div>${w.routine.days.map((d, i) => {
+  if (fixed) {
+    const mon = weekOf(today), sun = addDays(mon, 6), WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const rows = w.routine.days.slice().sort((a, b) => ((a.dow + 6) % 7) - ((b.dow + 6) % 7)).map((d) => {
+      const date = addDays(mon, (d.dow + 6) % 7);
+      const did = Object.keys(w.sessions).find((x) => x >= mon && x <= sun && w.sessions[x].dayId === d.id && doneSets(w.sessions[x]) > 0);
+      const st = did ? 'done' : date === today ? 'today' : date < today ? 'missed' : 'next';
+      const tag = { done: '<span class="pill on" style="padding:5px 11px;font-size:13px">✓ Done</span>', today: '<span class="pill on" style="padding:5px 11px;font-size:13px">Today</span>', missed: '<span class="pill" style="padding:5px 11px;font-size:13px;color:var(--warn)">Missed</span>', next: '<span class="ghost" style="padding:0">Start</span>' }[st];
+      return `<button class="row" data-act="w-start" data-day="${d.id}"><div class="row-main"><div class="name">${WD[d.dow]} · ${esc(d.name)}</div><div class="sub">${esc(d.sub || '')}${d.sub ? ' · ' : ''}${d.exercises.length} exercises${lastBy[d.id] ? ' · last ' + dayName(lastBy[d.id], { month: 'short', day: 'numeric' }) : ''}</div></div>${tag}</button>`;
+    }).join('');
+    html += `<div class="list"><div class="list-h"><h2>This week</h2></div>${rows}</div>${w.routine.tip ? `<div class="small muted" style="padding:2px 18px 6px">${esc(w.routine.tip)}</div>` : ''}`;
+  } else html += `<div class="list"><div class="list-h"><h2>Rotation</h2></div>${w.routine.days.map((d, i) => {
     const isNext = planned && d.id === planned.id && !sess;
     return `<button class="row" data-act="w-start" data-day="${d.id}"><div class="row-main"><div class="name">${i + 1}. ${esc(d.name)}</div><div class="sub">${d.exercises.length} exercises · ${lastBy[d.id] ? 'last ' + dayName(lastBy[d.id], { month: 'short', day: 'numeric' }) : 'not done yet'}</div></div>${isNext ? '<span class="pill on" style="padding:5px 11px;font-size:13px">Up next</span>' : '<span class="ghost" style="padding:0">Start</span>'}</button>`;
   }).join('')}</div>`;
@@ -1074,7 +1242,7 @@ function viewTrain() {
   html += `<div class="list"><div class="list-h"><h2>Exercise progress</h2></div>${ids.map((id) => {
     const ex = findExercise(id); let top = '';
     for (const d of Object.keys(w.sessions).sort().reverse()) { const e = w.sessions[d].exercises.find((x) => x.exId === id && x.sets.some((s) => s.done)); if (e) { const best = e.sets.filter((s) => s.done).sort((a, b) => e1rm(numOf(b.w), numOf(b.r)) - e1rm(numOf(a.w), numOf(a.r)))[0]; top = `Last top set: ${fmt(numOf(best.w))} × ${fmt(numOf(best.r))}`; break; } }
-    return `<button class="row" data-act="ex-progress" data-id="${esc(id)}"><div class="row-main"><div class="name">${esc(ex.name)}</div><div class="sub">${top || 'No sessions logged yet'}</div></div><span class="muted">›</span></button>`;
+    return `<button class="row" data-act="ex-progress" data-id="${esc(id)}"><div class="row-main"><div class="name">${esc(ex.name)}${fixed ? ` <span class="muted small">${esc(dayOfEx(id))}</span>` : ''}</div><div class="sub">${top || 'No sessions logged yet'}</div></div><span class="muted">›</span></button>`;
   }).join('')}</div>`;
   return html;
 }
@@ -1108,11 +1276,13 @@ function sessionViewSheet(d) {
 function paintRoutine() {
   const box = $('#rt-list'); if (!box) return;
   const days = W().routine.days;
-  box.innerHTML = days.map((d, i) => `<div class="row"><button class="row-main" data-act="edit-day" data-id="${d.id}" style="text-align:left"><div class="name">${i + 1}. ${esc(d.name)}</div><div class="sub">${d.exercises.map((x) => esc(x.name.split(' / ')[0])).join(', ')}</div></button>
-    <div class="rx-btns" style="margin:0"><button data-act="day-move" data-id="${d.id}" data-dir="-1" aria-label="Move earlier" ${i === 0 ? 'disabled' : ''}>↑</button><button data-act="day-move" data-id="${d.id}" data-dir="1" aria-label="Move later" ${i === days.length - 1 ? 'disabled' : ''}>↓</button></div></div>`).join('');
+  const fixed = !!W().routine.fixed, WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  box.innerHTML = days.map((d, i) => `<div class="row"><button class="row-main" data-act="edit-day" data-id="${d.id}" style="text-align:left"><div class="name">${fixed ? `${WD[d.dow]} · ` : `${i + 1}. `}${esc(d.name)}</div><div class="sub">${d.exercises.map((x) => esc(x.name.split(' / ')[0])).join(', ')}</div></button>
+    ${fixed ? '' : `<div class="rx-btns" style="margin:0"><button data-act="day-move" data-id="${d.id}" data-dir="-1" aria-label="Move earlier" ${i === 0 ? 'disabled' : ''}>↑</button><button data-act="day-move" data-id="${d.id}" data-dir="1" aria-label="Move later" ${i === days.length - 1 ? 'disabled' : ''}>↓</button></div>`}</div>`).join('');
 }
 function routineSheet() {
-  openLayer(`<div class="sheet-title">Your rotation</div><div class="muted small">Workouts repeat in this order, whatever day of the week it is. Use ↑ ↓ to reorder, or tap a day to rename it or change its exercises. History stays attached to each exercise.</div>
+  const fx = !!W().routine.fixed;
+  openLayer(`<div class="sheet-title">${fx ? 'Your week' : 'Your rotation'}</div><div class="muted small">${fx ? 'Each session sits on a fixed weekday. Tap one to change its exercises, sets or rep ranges. History stays attached to each exercise.' : 'Workouts repeat in this order, whatever day of the week it is. Use ↑ ↓ to reorder, or tap a day to rename it or change its exercises. History stays attached to each exercise.'}</div>
     <div class="list" style="margin:12px 0 0" id="rt-list"></div>`);
   paintRoutine();
 }
@@ -1126,10 +1296,25 @@ function editDaySheet(dayId) {
     <div class="muted small" style="margin:10px 0">Variants: separate with commas to alternate between versions week to week (e.g. “T-bar row, Barbell row”).</div>
     <div class="btn-row"><button class="btn primary" id="rd-save">Save</button></div>`);
   const list = $('#rd-list', el);
-  const read = () => { draft.name = $('#rd-name', el).value.trim() || day.name; $$('.rx', el).forEach((box, i) => { const e = draft.exercises[i]; e.name = $('.rx-name', box).value.trim() || e.name; const reps = $('.rx-reps', box).value.split(/[^0-9]+/).map(Number).filter((n) => n > 0).slice(0, 8); if (reps.length) { e.reps = reps; e.sets = reps.length; } e.variants = $('.rx-var', box).value.split(',').map((x) => x.trim()).filter(Boolean); }); };
+  const read = () => {
+    draft.name = $('#rd-name', el).value.trim() || day.name;
+    $$('.rx', el).forEach((box, i) => {
+      const e = draft.exercises[i]; e.name = $('.rx-name', box).value.trim() || e.name;
+      if (e.range) {
+        const n = parseInt($('.rx-sets', box).value, 10), r = $('.rx-range', box).value.split(/[^0-9]+/).map(Number).filter((x) => x > 0), j = parseFloat($('.rx-jump', box).value);
+        if (n > 0 && n <= 10) e.sets = n;
+        if (r.length >= 2 && r[0] <= r[1]) e.range = [r[0], r[1]]; else if (r.length === 1) e.range = [r[0], r[0]];
+        if (Number.isFinite(j) && j >= 0) e.jump = j;
+        return;
+      }
+      const reps = $('.rx-reps', box).value.split(/[^0-9]+/).map(Number).filter((n) => n > 0).slice(0, 8); if (reps.length) { e.reps = reps; e.sets = reps.length; }
+      e.variants = $('.rx-var', box).value.split(',').map((x) => x.trim()).filter(Boolean);
+    });
+  };
   const paint = () => {
     list.innerHTML = draft.exercises.map((e, i) => `<div class="rx" data-i="${i}"><input class="rx-name" value="${esc(e.name)}" aria-label="Exercise name">
-      <div class="rx-row"><label style="width:46%">Reps per set<input class="rx-reps" inputmode="numeric" placeholder="12, 10, 8, 8" value="${esc(repsList(e).join(', '))}"></label><label style="flex:1">Variants (optional)<input class="rx-var" value="${esc(e.variants.join(', '))}"></label></div>
+      ${e.range ? `<div class="rx-row"><label style="width:28%">Sets<input class="rx-sets" inputmode="numeric" value="${e.sets}"></label><label style="width:34%">Rep range<input class="rx-range" inputmode="numeric" placeholder="6-8" value="${e.range[0]}-${e.range[1]}"></label><label style="flex:1">Add (lb)<input class="rx-jump" inputmode="decimal" value="${e.jump || 0}"></label></div>`
+      : `<div class="rx-row"><label style="width:46%">Reps per set<input class="rx-reps" inputmode="numeric" placeholder="12, 10, 8, 8" value="${esc(repsList(e).join(', '))}"></label><label style="flex:1">Variants (optional)<input class="rx-var" value="${esc(e.variants.join(', '))}"></label></div>`}
       <div class="rx-btns"><button data-rx="up">↑ Up</button><button data-rx="down">↓ Down</button><button data-rx="del" style="color:var(--danger)">✕ Remove</button></div></div>`).join('');
   };
   paint();
@@ -1176,8 +1361,17 @@ function exerciseHistoryContext() {
       for (const s of e.sets) if (s.done) best = Math.max(best, e1rm(numOf(s.w), numOf(s.r)));
       if (recent.length < 6) recent.push({ date, variant: e.variant || undefined, sets: e.sets.filter((s) => s.done).map((s) => `${numOf(s.w)}x${numOf(s.r)}`).join(' ') });
     }
+    let next;
+    if (ex.range) { // computed here with your sheet's rule, so the coach quotes it instead of doing the arithmetic
+      const last = priorSets(ex.id, '', addDays(todayStr(), 1)), prog = progression(ex, last);
+      if (!last) next = { action: 'first_session', weights_lb: w.baseline[ex.id] || undefined, reason: 'no history yet: use the starting weights' };
+      else if (prog.up) next = { action: 'add_weight', weights_lb: last.map((x) => (numOf(x.w) > 0 ? numOf(x.w) + prog.jump : numOf(x.w))), reason: `every set reached ${prog.hi} reps, so +${prog.jump} lb` };
+      else if (prog.hitTop) next = { action: 'make_it_harder', weights_lb: last.map((x) => numOf(x.w)), reason: `every set reached ${prog.hi} reps and there is no weight to add on this lift` };
+      else next = { action: 'repeat_weight', weights_lb: last.map((x) => numOf(x.w)), reason: `not every set reached ${prog.hi} reps: repeat the weight and add reps` };
+    }
     out.push({
       id: ex.id, name: ex.name, variants: ex.variants.length ? ex.variants : undefined, day: d.name, planned_reps_per_set: repsList(ex),
+      rep_range: ex.range || undefined, sets: ex.range ? ex.sets : undefined, weight_jump_lb: ex.range ? ex.jump : undefined, sheet_next_session: next,
       sessions_logged: recent.length, recent_sessions: recent, best_estimated_1rm_lb: Math.round(best) || undefined,
       starting_weights_lb: !recent.length && w.baseline[ex.id] ? w.baseline[ex.id] : undefined,
     });
@@ -1189,7 +1383,9 @@ function workoutContext(date) {
   const w = W(), planned = plannedDay(date), s = sessionOn(date);
   const last7 = [...Array(7)].map((_, i) => addDays(todayStr(), -i)).filter((d) => w.sessions[d] && doneSets(w.sessions[d])).map((d) => ({ date: d, workout: w.sessions[d].dayName, sets: doneSets(w.sessions[d]), volume_lb: Math.round(volumeOf(w.sessions[d])) }));
   return {
-    nextInRotation: planned ? planned.name : null,
+    schedule: w.routine.fixed ? 'fixed weekdays' : 'rotation (not tied to weekdays)',
+    scheduledToday: w.routine.fixed ? (planned ? planned.name : restNote(date) || 'no session') : undefined,
+    nextInRotation: w.routine.fixed ? undefined : planned ? planned.name : null,
     today: s ? { workout: s.dayName, finished: !!s.finishedAt, sets_done: doneSets(s), volume_lb: Math.round(volumeOf(s)), cardio_min: s.cardioMin || 0, exercises: s.exercises.filter((e) => e.sets.some((x) => x.done)).map((e) => ({ name: e.variant || e.name, sets: setTxt(e.sets.filter((x) => x.done)) })) } : null,
     last7Days: last7,
   };
@@ -1569,7 +1765,7 @@ function libTrySheet() {
 
 /* under a coach answer: where it came from, with a link to each video at the right moment */
 function sourceRow(m) {
-  const badge = { library: 'From your video library', partly: 'Partly from your library', general: 'Not from your library' }[m.grounding] || '';
+  const badge = { program: 'From your program', library: 'From your video library', partly: 'Partly from your library', general: S.plan ? 'Not from your sheet or library' : 'Not from your library' }[m.grounding] || '';
   const links = (m.sources || []).map((s) => {
     const t = Math.max(0, +s.t || 0), lab = `${esc(s.title)} · ${mmss(t)}`;
     return /^[\w-]{11}$/.test(s.vid || '') ? `<a class="src-link" href="https://www.youtube.com/watch?v=${s.vid}&t=${t}s" target="_blank" rel="noopener noreferrer">${lab}</a>` : `<span class="src-link">${lab}</span>`;
@@ -1633,7 +1829,8 @@ function viewSettings() {
   const row = (k, label) => `<div class="tgt"><span>${label}</span><input type="number" inputmode="decimal" data-t="${k}" value="${T[k]}"></div>`;
   const last = S.lastBackup ? new Date(S.lastBackup).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : 'never';
   return `<div class="top"><div><h1>Settings</h1><div class="sub">Everything stays on this phone</div></div></div>
-  <div class="card"><h2>Daily targets</h2>${row('k', 'Calories (kcal)')}${row('p', 'Protein (g)')}${row('c', 'Carbs (g)')}${row('f', 'Fat (g)')}${row('s', 'Sugar limit (g)')}
+  ${planCardHtml()}
+  <div class="card"><h2>${S.plan ? 'Older single target' : 'Daily targets'}</h2>${S.plan ? '<div class="small muted" style="margin-bottom:8px">Used for days before the plan starts.</div>' : ''}${row('k', 'Calories (kcal)')}${row('p', 'Protein (g)')}${row('c', 'Carbs (g)')}${row('f', 'Fat (g)')}${S.plan ? '' : row('s', 'Sugar limit (g)')}
     <div class="small muted" id="macro-hint">${hint(kcalFromMacros, T.k)}</div></div>
   <div class="card"><h2>Supplements</h2>${S.supps.map((s) => `<div class="tgt" style="grid-template-columns:1fr auto"><span>${esc(s.name)}${s.dose ? ` <span class="muted small">· ${esc(s.dose)}</span>` : ''}</span><button class="ghost" style="color:var(--danger)" data-act="del-supp" data-id="${s.id}">Remove</button></div>`).join('')}
     <div class="grid2" style="margin-top:8px"><div class="field" style="margin:0"><input id="sp-name" placeholder="Name" autocomplete="off"></div><div class="field" style="margin:0"><input id="sp-dose" placeholder="Dose (optional)" autocomplete="off"></div></div>
@@ -1664,6 +1861,42 @@ function viewSettings() {
     <input type="file" id="import-file" accept=".json,application/json" hidden>
     <div class="small muted" style="margin-top:10px" id="persist-note"></div></div>
   <div class="card" id="install-card" hidden><h2>Install</h2><button class="btn primary block" data-act="install">Install app on this phone</button></div>`;
+}
+const planHint = (p) => ['lift', 'off'].map((kk) => { const t = p[kk], m = t.p * 4 + t.c * 4 + t.f * 9; return `${kk === 'lift' ? 'Lifting' : 'Off'} day macros add up to ${fmtK(m)} kcal${Math.abs(m - t.k) > 40 ? ` (target ${fmtK(t.k)})` : ''}`; }).join(' · ');
+function planCardHtml() {
+  const p = S.plan, WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const load = `<button class="btn block" data-act="plan-load" style="margin-top:10px">${p ? 'Load a new program file…' : 'Load program file…'}</button><input type="file" id="plan-file" accept=".json,application/json" hidden>`;
+  if (!p) return `<div class="card"><h2>Program</h2><div class="small muted">Load your program file to switch from one daily target to lifting-day and off-day targets, fixed weekly sessions with rep ranges, and weekly check-ins.</div>${load}</div>`;
+  const cell = (kind, m) => `<input type="number" inputmode="decimal" data-pt="${kind}.${m}" value="${p[kind][m]}" aria-label="${kind === 'lift' ? 'Lifting day' : 'Off day'} ${m}">`;
+  return `<div class="card"><h2>${esc(p.name)} · from ${dayName(p.start, { month: 'short', day: 'numeric' })}</h2>
+    <div class="small muted" style="margin-bottom:10px">Targets follow the calendar, not whether you trained. Lifting days: ${(p.liftDays || []).map((i) => WD[i]).join(', ')}.</div>
+    <div class="ptgrid"><span></span><b>Lifting day</b><b>Off day</b>
+      <span>Calories</span>${cell('lift', 'k')}${cell('off', 'k')}
+      <span>Protein (g)</span>${cell('lift', 'p')}${cell('off', 'p')}
+      <span>Carbs (g)</span>${cell('lift', 'c')}${cell('off', 'c')}
+      <span>Fat (g)</span>${cell('lift', 'f')}${cell('off', 'f')}</div>
+    <div class="tgt" style="margin:12px 0 6px"><span>Sugar limit (g), every day</span><input type="number" inputmode="decimal" data-t="s" value="${S.targets.s}"></div>
+    <div class="small muted" id="plan-hint">${planHint(p)}</div>${load}</div>`;
+}
+/* the program file is private (it has your targets and body numbers); nothing in this app's public code contains them */
+function loadPlanFile(file) {
+  const rd = new FileReader();
+  rd.onload = () => {
+    let o;
+    try { o = JSON.parse(rd.result); if (!o || o.lbl !== 'plan' || !o.plan || !o.plan.lift || !o.plan.off || !o.plan.start) throw new Error('bad'); } catch (e) { toast('That file is not a program file'); return; }
+    const days = o.routine && Array.isArray(o.routine.days) ? o.routine.days : [], nEx = days.reduce((n, d) => n + (d.exercises || []).length, 0);
+    askConfirm(`Load “${o.plan.name}”? From ${dayName(o.plan.start, { month: 'short', day: 'numeric' })} your targets become ${fmtK(o.plan.lift.k)} kcal on lifting days and ${fmtK(o.plan.off.k)} on off days${days.length ? `, and your routine becomes ${days.length} sessions on fixed weekdays (${nEx} exercises). Your old routine and every log stay saved` : ''}${S.plan ? '. This replaces the plan numbers you have now, including any calorie adjustments' : ''}. You can undo it.`, 'Load program', () => applyPlanFile(o));
+  };
+  rd.readAsText(file);
+}
+function applyPlanFile(o) {
+  snapshotBefore('program');
+  const w = W();
+  S.plan = JSON.parse(JSON.stringify(o.plan));
+  if (o.routine && Array.isArray(o.routine.days) && o.routine.days.length) { w.oldRoutine = w.routine; w.routine = JSON.parse(JSON.stringify(o.routine)); }
+  for (const [k, v] of Object.entries(o.baseline || {})) if (Array.isArray(v) && v.length) w.baseline[k] = v;
+  for (const [d, v] of Object.entries(o.weights || {})) if (/^\d{4}-\d\d-\d\d$/.test(d) && v > 0 && !S.weights[d]) S.weights[d] = v;
+  save(); refresh(); toast('Program loaded', () => undoImport());
 }
 const hint = (fromMacros, k) => `Your macros add up to <b>${fmtK(fromMacros)} kcal</b>${Math.abs(fromMacros - k) > 40 ? ` (target is ${fmtK(k)}). <button class="ghost" style="padding:0" data-act="sync-kcal">Set calories to ${fmtK(fromMacros)}</button>` : ' — matches your calorie target.'}`;
 
@@ -1751,10 +1984,13 @@ function mergeBackup(o) {
     for (const [d, s] of Object.entries(o.workouts.sessions || {})) if (s && Array.isArray(s.exercises) && !w.sessions[d]) { w.sessions[d] = s; addedSessions++; }
     for (const [k, v] of Object.entries(o.workouts.baseline || {})) if (Array.isArray(v) && v.length && !w.baseline[k]) { w.baseline[k] = v; addedBase++; }
   }
+  let addedWeights = 0;
+  for (const [d, v] of Object.entries(o.weights || {})) if (v > 0 && !S.weights[d]) { S.weights[d] = v; addedWeights++; }
+  if (o.plan && !S.plan) S.plan = o.plan;
   let addedDocs = 0; // knowledge-base documents, matched by title so importing twice never duplicates them
   for (const d of o.knowledge || []) if (d && d.title && typeof d.text === 'string' && d.text.trim() && !S.knowledge.some((x) => x.title === d.title) && kbTotal() + d.text.length <= KB_MAX) { S.knowledge.push({ id: 'k' + uid(), title: String(d.title).slice(0, 80), text: d.text, on: d.on !== false, ts: Date.now() }); addedDocs++; }
   save(); refresh();
-  const anything = addedEntries || addedFoods || addedSessions || addedBase || addedDocs;
+  const anything = addedEntries || addedFoods || addedSessions || addedBase || addedDocs || addedWeights;
   toast(anything ? `Merged ${addedEntries} food entries (${addedDays} new days), ${addedFoods} new foods${addedSessions || addedBase ? `, ${addedSessions} workouts, ${addedBase} starting weights` : ''}${addedDocs ? `, ${addedDocs} documents` : ''}` : 'Nothing new to merge — it’s already in the app', anything ? () => { S = JSON.parse(snap); ensureWorkouts(); save(); refresh(); } : null);
   return { addedEntries, addedDays, addedFoods, addedMeals, addedSessions, addedBase, addedDocs };
 }
@@ -1815,6 +2051,11 @@ const actions = {
   'merge-json': () => $('#merge-file').click(),
   'undo-import': () => askConfirm('Undo the last import and go back to exactly what the app held before it?', 'Undo', () => undoImport()),
   'goto-train': () => { tab = 'train'; window.scrollTo(0, 0); render(); },
+  'weight-save': () => saveWeight(),
+  'weight-edit': () => { weightEdit = true; refresh(); const i = $('#wt-in'); if (i) { i.focus(); i.select(); } },
+  'open-checkins': () => checkinsSheet(),
+  'adjust-apply': (el) => applyAdjust(+el.dataset.delta, +el.dataset.week),
+  'plan-load': () => { const f = $('#plan-file'); if (f) f.click(); },
   'w-start': (el) => startSession(el.dataset.day, todayStr()),
   'w-open': (el) => openWorkout(el.dataset.d),
   'w-finish': () => finishSheet(),
@@ -1887,6 +2128,7 @@ document.addEventListener('input', (e) => {
 // Enter jumps to the same box in the next set (type a whole weights line, like your sheet)
 document.addEventListener('keydown', (e) => {
   const t = e.target;
+  if (e.key === 'Enter' && t.id === 'wt-in') { e.preventDefault(); saveWeight(); return; }
   if (e.key !== 'Enter' || !workoutEl || !t.dataset || !t.dataset.f || !t.closest('.scol')) return;
   e.preventDefault();
   const next = t.closest('.scol').nextElementSibling && $(`input[data-f="${t.dataset.f}"]`, t.closest('.scol').nextElementSibling);
@@ -1898,6 +2140,11 @@ document.addEventListener('change', (e) => {
     const v = parseFloat(t.value);
     if (Number.isFinite(v) && v >= 0) { S.targets[t.dataset.t] = v; save(); const T = S.targets; $('#macro-hint').innerHTML = hint(T.p * 4 + T.c * 4 + T.f * 9, T.k); }
   }
+  if (t.dataset && t.dataset.pt && S.plan) {
+    const [kind, m] = t.dataset.pt.split('.'), v = parseFloat(t.value);
+    if (S.plan[kind] && ['k', 'p', 'c', 'f'].includes(m) && Number.isFinite(v) && v >= 0) { S.plan[kind][m] = v; save(); const h = $('#plan-hint'); if (h) h.textContent = planHint(S.plan); }
+  }
+  if (t.id === 'plan-file' && t.files[0]) { loadPlanFile(t.files[0]); t.value = ''; }
   if (t.id === 'import-file' && t.files[0]) { importJson(t.files[0]); t.value = ''; }
   if (t.id === 'merge-file' && t.files[0]) { importJson(t.files[0], true); t.value = ''; }
   if (t.dataset && t.dataset.scan) { const clean = t.value.replace(/\s+/g, ''); t.value = clean; const c = scanCfg(); c[t.dataset.scan] = clean; setScanCfg(c); }
